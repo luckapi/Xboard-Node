@@ -209,6 +209,14 @@ func TestBuildConfig_VMess_Users(t *testing.T) {
 	if ib["protocol"] != "vmess" {
 		t.Errorf("expected protocol vmess, got %v", ib["protocol"])
 	}
+	sniffing := ib["sniffing"].(map[string]interface{})
+	if sniffing["enabled"] != true {
+		t.Fatalf("expected inbound sniffing enabled, got %v", sniffing["enabled"])
+	}
+	destOverride := sniffing["destOverride"].([]interface{})
+	if len(destOverride) != 3 || destOverride[0] != "http" || destOverride[1] != "tls" || destOverride[2] != "quic" {
+		t.Fatalf("unexpected sniffing destOverride: %v", destOverride)
+	}
 
 	settings := ib["settings"].(map[string]interface{})
 	clients := settings["clients"].([]interface{})
@@ -330,6 +338,7 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 		{
 			Name: "proxy-web",
 			Match: model.RouteMatch{
+				DomainKeywords: []string{"keyword-example"},
 				Domains:        []string{"full.example.com"},
 				DomainSuffixes: []string{"example.org"},
 				Ports:          []string{"80", "443-445"},
@@ -349,7 +358,7 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 	if xrayRules[0]["outboundTag"] != "warp-jp" {
 		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[0]["outboundTag"])
 	}
-	if got := xrayRules[0]["domain"].([]string); len(got) != 2 || got[0] != "full.example.com" || got[1] != "domain:example.org" {
+	if got := xrayRules[0]["domain"].([]string); len(got) != 3 || got[0] != "keyword:keyword-example" || got[1] != "full.example.com" || got[2] != "domain:example.org" {
 		t.Fatalf("unexpected custom domains: %v", got)
 	}
 	if got := xrayRules[1]["port"]; got != "80,443-445" {

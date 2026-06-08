@@ -1,12 +1,14 @@
 package xray
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/cedar2025/xboard-node/internal/blocklist"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -77,8 +79,16 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 			"supported", "vmess, vless, trojan, shadowsocks, hysteria, socks, http")
 	}
 
-	// Merge panel routes and static config routes
-	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	customRouteRules := append([]model.CustomRouteRule{}, nc.CustomRouteRules...)
+	blockRules, err := blocklist.LoadRules(context.Background(), kcfg.BlockList)
+	if err != nil {
+		nlog.Core().Error("failed to load blocklist routes", "error", err)
+	} else {
+		customRouteRules = append(customRouteRules, blockRules...)
+	}
+
+	// Merge panel routes, node-side blocklist, and static config routes.
+	cfg["routing"] = buildRouting(nc.Routes, customRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
 	mergeCustomXray(cfg, kcfg)
 	return cfg
@@ -207,6 +217,10 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		"listen":   listenAddr,
 		"port":     nc.ServerPort,
 		"protocol": nc.Protocol,
+		"sniffing": M{
+			"enabled":      true,
+			"destOverride": []string{"http", "tls", "quic"},
+		},
 		"streamSettings": M{
 			"sockopt": M{
 				"reusePort": true,
@@ -724,8 +738,15 @@ func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 	outbound := xrayOutboundForAction(rule.Action)
 	var compiled []M
 
-	if len(rule.Match.Domains) > 0 || len(rule.Match.DomainSuffixes) > 0 {
-		domains := make([]string, 0, len(rule.Match.Domains)+len(rule.Match.DomainSuffixes))
+	if len(rule.Match.DomainKeywords) > 0 || len(rule.Match.Domains) > 0 || len(rule.Match.DomainSuffixes) > 0 {
+		domains := make([]string, 0, len(rule.Match.DomainKeywords)+len(rule.Match.Domains)+len(rule.Match.DomainSuffixes))
+		for _, value := range rule.Match.DomainKeywords {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			domains = append(domains, "keyword:"+value)
+		}
 		for _, value := range rule.Match.Domains {
 			value = strings.TrimSpace(value)
 			if value == "" {

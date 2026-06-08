@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cedar2025/xboard-node/internal/blocklist"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -58,13 +60,21 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		cfg["inbounds"] = []M{inbound}
 	}
 
-	// Merge panel routes and static config routes
-	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	customRouteRules := append([]model.CustomRouteRule{}, nc.CustomRouteRules...)
+	blockRules, err := blocklist.LoadRules(context.Background(), kcfg.BlockList)
+	if err != nil {
+		nlog.Core().Error("failed to load blocklist routes", "error", err)
+	} else {
+		customRouteRules = append(customRouteRules, blockRules...)
+	}
+
+	// Merge panel routes, node-side blocklist, and static config routes.
+	cfg["route"] = buildRoutes(nc.Routes, customRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
 	// Automatically enable rule_set caching (cache_file) when panel routes
 	// reference geoip:/geosite: entries so that the downloaded .srs rule_set
 	// files survive across process restarts.
-	if kernel.NeedsGeoIP(nc.Routes) || kernel.NeedsGeoSite(nc.Routes) || kernel.NeedsGeoIPRules(nc.CustomRouteRules) || kernel.NeedsGeoSiteRules(nc.CustomRouteRules) {
+	if kernel.NeedsGeoIP(nc.Routes) || kernel.NeedsGeoSite(nc.Routes) || kernel.NeedsGeoIPRules(customRouteRules) || kernel.NeedsGeoSiteRules(customRouteRules) {
 		cfg["experimental"] = M{
 			"cache_file": M{
 				"enabled": true,
@@ -145,7 +155,12 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 }
 
 func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any) M {
-	var rules []M
+	rules := []M{
+		{
+			"action":  "sniff",
+			"timeout": "1s",
+		},
+	}
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
 	for _, rule := range customRules {
@@ -162,8 +177,7 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 
 	// Standard blocks for private IPv4 and IPv6 ranges to prevent SSRF.
 	rules = append(rules,
-		M{
-			"outbound": "block",
+		singboxRejectRule(M{
 			"ip_cidr": []string{
 				"10.0.0.0/8",
 				"100.64.0.0/10",
@@ -174,15 +188,14 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 				"192.168.0.0/16",
 				"198.18.0.0/15",
 			},
-		},
-		M{
-			"outbound": "block",
+		}),
+		singboxRejectRule(M{
 			"ip_cidr": []string{
 				"fc00::/7",
 				"fe80::/10",
 				"::1/128",
 			},
-		},
+		}),
 	)
 
 	for _, pr := range panelRoutes {
@@ -214,34 +227,16 @@ func compilePanelRouteRule(pr model.RouteRule) []M {
 		domains = append(domains, item)
 	}
 
-	outbound := "block"
-	switch pr.Action {
-	case "direct":
-		outbound = "direct"
-	case "dns":
-		if pr.ActionValue != "" {
-			outbound = pr.ActionValue
-		} else {
-			outbound = "dns-out"
-		}
-	case "proxy":
-		if pr.ActionValue != "" {
-			outbound = pr.ActionValue
-		}
-	}
-
 	var compiled []M
 	if len(domains) > 0 {
-		compiled = append(compiled, M{
+		compiled = append(compiled, singboxRuleForPanelAction(pr, M{
 			"domain_suffix": copyStrings(domains),
-			"outbound":      outbound,
-		})
+		}))
 	}
 	if len(cidrs) > 0 {
-		compiled = append(compiled, M{
-			"ip_cidr":  copyStrings(cidrs),
-			"outbound": outbound,
-		})
+		compiled = append(compiled, singboxRuleForPanelAction(pr, M{
+			"ip_cidr": copyStrings(cidrs),
+		}))
 	}
 	return compiled
 }
@@ -251,60 +246,59 @@ func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 		return nil
 	}
 
-	outbound := singboxOutboundForAction(rule.Action)
 	var compiled []M
 
+	if len(rule.Match.DomainKeywords) > 0 {
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
+			"domain_keyword": copyStrings(rule.Match.DomainKeywords),
+		}))
+	}
 	if len(rule.Match.Domains) > 0 {
-		compiled = append(compiled, M{
-			"domain":   copyStrings(rule.Match.Domains),
-			"outbound": outbound,
-		})
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
+			"domain": copyStrings(rule.Match.Domains),
+		}))
 	}
 	if len(rule.Match.DomainSuffixes) > 0 {
-		compiled = append(compiled, M{
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
 			"domain_suffix": copyStrings(rule.Match.DomainSuffixes),
-			"outbound":      outbound,
-		})
+		}))
 	}
 	if len(rule.Match.IPCIDRs) > 0 {
-		compiled = append(compiled, M{
-			"ip_cidr":  copyStrings(rule.Match.IPCIDRs),
-			"outbound": outbound,
-		})
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
+			"ip_cidr": copyStrings(rule.Match.IPCIDRs),
+		}))
 	}
 	if len(rule.Match.Ports) > 0 {
 		ports, portRanges := splitPorts(rule.Match.Ports)
-		entry := M{"outbound": outbound}
+		entry := M{}
 		if len(ports) > 0 {
 			entry["port"] = ports
 		}
 		if len(portRanges) > 0 {
 			entry["port_range"] = portRanges
 		}
-		compiled = append(compiled, entry)
+		compiled = append(compiled, singboxRuleForAction(rule.Action, entry))
 	}
 	if len(rule.Match.Networks) > 0 {
-		compiled = append(compiled, M{
-			"network":  copyStrings(rule.Match.Networks),
-			"outbound": outbound,
-		})
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
+			"network": copyStrings(rule.Match.Networks),
+		}))
 	}
 	if len(rule.Match.SourceCIDRs) > 0 {
-		compiled = append(compiled, M{
+		compiled = append(compiled, singboxRuleForAction(rule.Action, M{
 			"source_ip_cidr": copyStrings(rule.Match.SourceCIDRs),
-			"outbound":       outbound,
-		})
+		}))
 	}
 	if len(rule.Match.SourcePorts) > 0 {
 		ports, portRanges := splitPorts(rule.Match.SourcePorts)
-		entry := M{"outbound": outbound}
+		entry := M{}
 		if len(ports) > 0 {
 			entry["source_port"] = ports
 		}
 		if len(portRanges) > 0 {
 			entry["source_port_range"] = portRanges
 		}
-		compiled = append(compiled, entry)
+		compiled = append(compiled, singboxRuleForAction(rule.Action, entry))
 	}
 	return compiled
 }
@@ -321,6 +315,55 @@ func singboxOutboundForAction(action model.RouteAction) string {
 	default:
 		return "block"
 	}
+}
+
+func singboxRuleForPanelAction(panelRule model.RouteRule, match M) M {
+	switch panelRule.Action {
+	case "direct":
+		return singboxRouteRule("direct", match)
+	case "dns":
+		target := "dns-out"
+		if panelRule.ActionValue != "" {
+			target = panelRule.ActionValue
+		}
+		return singboxRouteRule(target, match)
+	case "proxy":
+		target := "block"
+		if panelRule.ActionValue != "" {
+			target = panelRule.ActionValue
+		}
+		return singboxRouteRule(target, match)
+	default:
+		return singboxRejectRule(match)
+	}
+}
+
+func singboxRuleForAction(action model.RouteAction, match M) M {
+	if action.Type == "block" || action.Type == "" {
+		return singboxRejectRule(match)
+	}
+	return singboxRouteRule(singboxOutboundForAction(action), match)
+}
+
+func singboxRouteRule(outbound string, match M) M {
+	rule := copyRuleMap(match)
+	rule["action"] = "route"
+	rule["outbound"] = outbound
+	return rule
+}
+
+func singboxRejectRule(match M) M {
+	rule := copyRuleMap(match)
+	rule["action"] = "reject"
+	return rule
+}
+
+func copyRuleMap(match M) M {
+	rule := make(M, len(match)+2)
+	for k, v := range match {
+		rule[k] = v
+	}
+	return rule
 }
 
 func splitPorts(values []string) ([]int, []string) {
@@ -434,6 +477,9 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
+		"sniff":       true,
+		// Domain-based block rules need the sniffed Host/SNI to participate in routing.
+		"sniff_override_destination": true,
 	}
 
 	switch nc.Protocol {

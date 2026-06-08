@@ -70,6 +70,8 @@ func TestBuildInbound_VMess(t *testing.T) {
 	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{})
 	assertMapValue(t, inbound, "type", "vmess")
 	assertMapValue(t, inbound, "tag", "vmess-in")
+	assertMapValue(t, inbound, "sniff", true)
+	assertMapValue(t, inbound, "sniff_override_destination", true)
 
 	users := inbound["users"].([]M)
 	assertMapValue(t, users[0], "uuid", "aaaaaaaa-1111-2222-3333-444444444444")
@@ -615,11 +617,13 @@ func TestBuildRoutes_Default(t *testing.T) {
 	assertMapValue(t, route, "final", "direct")
 
 	rules := route["rules"].([]M)
-	if len(rules) < 2 {
-		t.Fatalf("expected at least 2 default rules, got %d", len(rules))
+	if len(rules) < 3 {
+		t.Fatalf("expected at least 3 default rules, got %d", len(rules))
 	}
-	assertMapValue(t, rules[0], "outbound", "block")
-	assertMapValue(t, rules[1], "outbound", "block")
+	assertMapValue(t, rules[0], "action", "sniff")
+	assertMapValue(t, rules[0], "timeout", "1s")
+	assertMapValue(t, rules[1], "action", "reject")
+	assertMapValue(t, rules[2], "action", "reject")
 }
 
 func TestBuildRoutes_WithCustomRules(t *testing.T) {
@@ -631,17 +635,19 @@ func TestBuildRoutes_WithCustomRules(t *testing.T) {
 	route := buildRoutes(testRouteRules(rules), nil, nil)
 	allRules := route["rules"].([]M)
 
-	if len(allRules) != 5 {
-		t.Fatalf("rules count: got %d, want 5", len(allRules))
+	if len(allRules) != 6 {
+		t.Fatalf("rules count: got %d, want 6", len(allRules))
 	}
 
-	assertMapValue(t, allRules[2], "outbound", "block")
-	if _, ok := allRules[2]["domain_suffix"]; !ok {
+	assertMapValue(t, allRules[0], "action", "sniff")
+
+	assertMapValue(t, allRules[3], "action", "reject")
+	if _, ok := allRules[3]["domain_suffix"]; !ok {
 		t.Error("domain rule should use domain_suffix")
 	}
 
-	assertMapValue(t, allRules[3], "outbound", "block")
-	if _, ok := allRules[3]["ip_cidr"]; !ok {
+	assertMapValue(t, allRules[4], "action", "reject")
+	if _, ok := allRules[4]["ip_cidr"]; !ok {
 		t.Error("IP rule should use ip_cidr")
 	}
 }
@@ -656,31 +662,31 @@ func TestBuildRoutes_MultiMatch(t *testing.T) {
 	route := buildRoutes(testRouteRules(rules), nil, nil)
 	allRules := route["rules"].([]M)
 
-	// 2 default private-IP rules + 1 domain rule + 1 CIDR rule + 1 domain rule = 5
-	if len(allRules) != 5 {
-		t.Fatalf("rules count: got %d, want 5", len(allRules))
+	// 1 sniff rule + 2 default private-IP rules + 1 domain rule + 1 CIDR rule + 1 domain rule = 6
+	if len(allRules) != 6 {
+		t.Fatalf("rules count: got %d, want 6", len(allRules))
 	}
 
-	// Rule #2 (index 2): domains from first route (wildcards stripped)
-	domains := allRules[2]["domain_suffix"].([]string)
+	// Rule #3 (index 3): domains from first route (wildcards stripped)
+	domains := allRules[3]["domain_suffix"].([]string)
 	if len(domains) != 2 || domains[0] != "evil.com" || domains[1] != "bad.org" {
 		t.Errorf("domain_suffix: got %v, want [evil.com bad.org]", domains)
 	}
-	assertMapValue(t, allRules[2], "outbound", "block")
+	assertMapValue(t, allRules[3], "action", "reject")
 
-	// Rule #3 (index 3): CIDRs from first route
-	cidrs := allRules[3]["ip_cidr"].([]string)
+	// Rule #4 (index 4): CIDRs from first route
+	cidrs := allRules[4]["ip_cidr"].([]string)
 	if len(cidrs) != 1 || cidrs[0] != "192.168.1.0/24" {
 		t.Errorf("ip_cidr: got %v, want [192.168.1.0/24]", cidrs)
 	}
-	assertMapValue(t, allRules[3], "outbound", "block")
+	assertMapValue(t, allRules[4], "action", "reject")
 
-	// Rule #4 (index 4): direct rule (wildcard stripped)
-	directDomains := allRules[4]["domain_suffix"].([]string)
+	// Rule #5 (index 5): direct rule (wildcard stripped)
+	directDomains := allRules[5]["domain_suffix"].([]string)
 	if len(directDomains) != 1 || directDomains[0] != "bypass.com" {
 		t.Errorf("direct domain_suffix: got %v, want [bypass.com]", directDomains)
 	}
-	assertMapValue(t, allRules[4], "outbound", "direct")
+	assertMapValue(t, allRules[5], "outbound", "direct")
 }
 
 func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
@@ -688,6 +694,7 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 		{
 			Name: "direct-mixed",
 			Match: model.RouteMatch{
+				DomainKeywords: []string{"keyword-example"},
 				Domains:        []string{"full.example.com"},
 				DomainSuffixes: []string{"example.org"},
 				IPCIDRs:        []string{"1.1.1.0/24"},
@@ -701,29 +708,35 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 	}
 	route := buildRoutes(nil, customRules, nil)
 	allRules := route["rules"].([]M)
-	if len(allRules) != 9 {
-		t.Fatalf("rules count: got %d, want 9", len(allRules))
+	if len(allRules) != 11 {
+		t.Fatalf("rules count: got %d, want 11", len(allRules))
 	}
-	if allRules[0]["domain"].([]string)[0] != "full.example.com" {
-		t.Fatalf("unexpected exact domain rule: %v", allRules[0])
+	if allRules[0]["action"] != "sniff" {
+		t.Fatalf("unexpected first rule: %v", allRules[0])
 	}
-	if allRules[1]["domain_suffix"].([]string)[0] != "example.org" {
-		t.Fatalf("unexpected domain suffix rule: %v", allRules[1])
+	if allRules[1]["domain_keyword"].([]string)[0] != "keyword-example" {
+		t.Fatalf("unexpected domain keyword rule: %v", allRules[1])
 	}
-	if allRules[2]["ip_cidr"].([]string)[0] != "1.1.1.0/24" {
-		t.Fatalf("unexpected ip cidr rule: %v", allRules[2])
+	if allRules[2]["domain"].([]string)[0] != "full.example.com" {
+		t.Fatalf("unexpected exact domain rule: %v", allRules[2])
 	}
-	if allRules[3]["port"].([]int)[0] != 53 {
-		t.Fatalf("unexpected port rule: %v", allRules[3])
+	if allRules[3]["domain_suffix"].([]string)[0] != "example.org" {
+		t.Fatalf("unexpected domain suffix rule: %v", allRules[3])
 	}
-	if allRules[4]["network"].([]string)[0] != "tcp" {
-		t.Fatalf("unexpected network rule: %v", allRules[4])
+	if allRules[4]["ip_cidr"].([]string)[0] != "1.1.1.0/24" {
+		t.Fatalf("unexpected ip cidr rule: %v", allRules[4])
 	}
-	if allRules[5]["source_ip_cidr"].([]string)[0] != "10.10.0.0/16" {
-		t.Fatalf("unexpected source cidr rule: %v", allRules[5])
+	if allRules[5]["port"].([]int)[0] != 53 {
+		t.Fatalf("unexpected port rule: %v", allRules[5])
 	}
-	if allRules[6]["source_port_range"].([]string)[0] != "2000:2001" {
-		t.Fatalf("unexpected source port rule: %v", allRules[6])
+	if allRules[6]["network"].([]string)[0] != "tcp" {
+		t.Fatalf("unexpected network rule: %v", allRules[6])
+	}
+	if allRules[7]["source_ip_cidr"].([]string)[0] != "10.10.0.0/16" {
+		t.Fatalf("unexpected source cidr rule: %v", allRules[7])
+	}
+	if allRules[8]["source_port_range"].([]string)[0] != "2000:2001" {
+		t.Fatalf("unexpected source port rule: %v", allRules[8])
 	}
 }
 
@@ -735,11 +748,14 @@ func TestBuildRoutes_StructuredCustomRulesRemainFirst(t *testing.T) {
 	}}
 	route := buildRoutes(nil, custom, raw)
 	allRules := route["rules"].([]M)
-	if allRules[0]["outbound"] != "direct" {
-		t.Fatalf("expected structured route first, got %v", allRules[0]["outbound"])
+	if allRules[0]["action"] != "sniff" {
+		t.Fatalf("expected sniff rule first, got %v", allRules[0])
 	}
-	if allRules[1]["outbound"] != "raw-tag" {
-		t.Fatalf("expected raw custom route second, got %v", allRules[1]["outbound"])
+	if allRules[1]["outbound"] != "direct" {
+		t.Fatalf("expected structured route second, got %v", allRules[1]["outbound"])
+	}
+	if allRules[2]["outbound"] != "raw-tag" {
+		t.Fatalf("expected raw custom route third, got %v", allRules[2]["outbound"])
 	}
 }
 

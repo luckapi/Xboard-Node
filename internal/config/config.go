@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -142,6 +142,28 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// BlockList enables node-side website blocking from line-based lists such
+	// as Rakau/blockList. Each non-empty, non-comment line is converted to a
+	// block routing rule.
+	BlockList BlockListConfig `yaml:"blocklist"`
+}
+
+type BlockListConfig struct {
+	Enabled *bool  `yaml:"enabled,omitempty"`
+	Path    string `yaml:"path,omitempty"`
+	URL     string `yaml:"url,omitempty"`
+}
+
+func (c BlockListConfig) EffectiveEnabled() bool {
+	if c.Enabled != nil {
+		return *c.Enabled
+	}
+	return strings.TrimSpace(c.Path) != "" || strings.TrimSpace(c.URL) != ""
+}
+
+func (c BlockListConfig) IsZero() bool {
+	return c.Enabled == nil && strings.TrimSpace(c.Path) == "" && strings.TrimSpace(c.URL) == ""
 }
 
 type CertConfig struct {
@@ -512,6 +534,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if len(c.Kernel.CustomRoute) == 0 {
 		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
+	}
+	if c.Kernel.BlockList.IsZero() {
+		c.Kernel.BlockList = parent.Kernel.BlockList
 	}
 	// Cert (NOT cert_dir — derived from config_dir later)
 	if c.Cert.CertMode == "" {

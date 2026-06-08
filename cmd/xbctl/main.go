@@ -54,7 +54,7 @@ type fileRootConfig struct {
 	WS        *config.WSConfig   `yaml:"ws,omitempty"`
 	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
 	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance      `yaml:"instances,omitempty"`
+	Instances []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
@@ -92,13 +92,14 @@ type fileNodeConfig struct {
 }
 
 type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+	Type         string                 `yaml:"type"`
+	ConfigDir    string                 `yaml:"config_dir"`
+	LogLevel     string                 `yaml:"log_level,omitempty"`
+	GeoDataDir   string                 `yaml:"geo_data_dir,omitempty"`
+	CustomConfig string                 `yaml:"custom_config,omitempty"`
+	CustomRoute  []map[string]any       `yaml:"custom_route,omitempty"`
+	CustomOut    []map[string]any       `yaml:"custom_outbound,omitempty"`
+	BlockList    config.BlockListConfig `yaml:"blocklist,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -849,8 +850,12 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || !p.Kernel.BlockList.IsZero() {
+		out.Kernel = &fileKernelConfig{
+			Type:      p.Kernel.Type,
+			LogLevel:  p.Kernel.LogLevel,
+			BlockList: p.Kernel.BlockList,
+		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -887,6 +892,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				CustomConfig: inst.Kernel.CustomConfig,
 				CustomRoute:  inst.Kernel.CustomRoute,
 				CustomOut:    inst.Kernel.CustomOutbound,
+				BlockList:    inst.Kernel.BlockList,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,
@@ -1319,13 +1325,17 @@ func runConfigInit(args []string) error {
 	if mode == "machine" && machineID <= 0 {
 		return errors.New("--machine-id is required for machine mode")
 	}
+	if installRoot == "" {
+		installRoot = defaultInstallRoot
+	}
 
 	// Build the new instance.
 	inst := config.Config{
 		Panel: config.PanelConfig{URL: panelURL},
 		Kernel: config.KernelConfig{
-			Type:     kernelType,
-			LogLevel: "warn",
+			Type:      kernelType,
+			LogLevel:  "warn",
+			BlockList: config.BlockListConfig{Path: filepath.Join(installRoot, "blockList")},
 		},
 		Log:        config.LogConfig{Level: "info", Output: "stdout"},
 		HealthPort: healthPort,
@@ -1347,9 +1357,6 @@ func runConfigInit(args []string) error {
 	}
 	inst.InstanceID = instanceID
 
-	if installRoot == "" {
-		installRoot = "/etc/xboard-node"
-	}
 	inst.Kernel.ConfigDir = filepath.Join(installRoot, "instances", instanceID)
 
 	// Build credential env key.
@@ -1424,6 +1431,9 @@ func runConfigInit(args []string) error {
 		return errors.New("--output (or --config) is required")
 	}
 	if err := writeRootConfig(configOut, root); err != nil {
+		return err
+	}
+	if err := ensureBlockListSeed(inst.Kernel.BlockList.Path); err != nil {
 		return err
 	}
 
@@ -1556,6 +1566,33 @@ func runConfigHealthPort(args []string) error {
 	}
 	if root.Config.HealthPort > 0 {
 		fmt.Println(root.Config.HealthPort)
+	}
+	return nil
+}
+
+func ensureBlockListSeed(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create blocklist dir: %w", err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat blocklist file: %w", err)
+	}
+	const sample = `# Node-side audit/blocklist
+# One domain suffix, keyword, or CIDR per line.
+# Examples:
+# bbc.com
+# bbci.co.uk
+# github.com
+# falundafa
+`
+	if err := os.WriteFile(path, []byte(sample), 0o644); err != nil {
+		return fmt.Errorf("write blocklist seed: %w", err)
 	}
 	return nil
 }

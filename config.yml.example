@@ -10,6 +10,8 @@
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
+#   blocklist:
+#     url: "https://raw.githubusercontent.com/Rakau/blockList/main/blockList"
 # log:
 #   level: "info"
 # instances:

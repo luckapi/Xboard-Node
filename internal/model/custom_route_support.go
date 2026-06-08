@@ -4,6 +4,7 @@ func RouteSupportMatrix() map[string]KernelRouteSupport {
 	return map[string]KernelRouteSupport{
 		"xray": {
 			Matchers: []string{
+				"domain_keywords",
 				"domains",
 				"domain_suffixes",
 				"ip_cidrs",
@@ -16,6 +17,7 @@ func RouteSupportMatrix() map[string]KernelRouteSupport {
 		},
 		"singbox": {
 			Matchers: []string{
+				"domain_keywords",
 				"domains",
 				"domain_suffixes",
 				"ip_cidrs",

@@ -24,6 +24,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 			Name:     rule.Name,
 			Disabled: rule.Disabled,
 			Match: RouteMatch{
+				DomainKeywords: cloneStringSlice(rule.Match.DomainKeywords),
 				Domains:        cloneStringSlice(rule.Match.Domains),
 				DomainSuffixes: cloneStringSlice(rule.Match.DomainSuffixes),
 				IPCIDRs:        cloneStringSlice(rule.Match.IPCIDRs),
