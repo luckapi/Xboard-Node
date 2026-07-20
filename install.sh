@@ -375,11 +375,41 @@ run_with_retry() {
     return 1
 }
 
+deb_package_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+install_debian_dependencies() {
+    DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
+
+    local packages=()
+    if ! command -v curl >/dev/null 2>&1; then
+        packages+=(curl)
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        packages+=(wget)
+    fi
+    if ! deb_package_installed ca-certificates; then
+        packages+=(ca-certificates)
+    fi
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! DEBIAN_FRONTEND=noninteractive run_with_retry 3 3 apt-get install -y "${packages[@]}"; then
+        log_error "Failed to install required system packages: ${packages[*]}"
+        log_warn "APT may have broken dependencies. Run the following commands, then retry the installer:"
+        echo "  apt --fix-broken install"
+        echo "  apt-get install -y ${packages[*]}"
+        return 1
+    fi
+}
+
 install_dependencies() {
     case "$OS" in
         ubuntu|debian)
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1
+            install_debian_dependencies
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf >/dev/null 2>&1; then
