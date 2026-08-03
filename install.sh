@@ -18,6 +18,7 @@ BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 SERVICE_MANAGER="systemd"
+OPENRC_WRAPPER_PATH=""
 CLI_PATH="/usr/local/bin/xbctl"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 CLI_BINARY_SOURCE=""
@@ -120,6 +121,13 @@ rollback_install() {
             install -m 755 "$BACKUP_PATH/xbctl" "$CLI_PATH"
         else
             rm -f "$CLI_PATH"
+        fi
+        if [ -n "$OPENRC_WRAPPER_PATH" ]; then
+            if [ -f "$BACKUP_PATH/xboard-node-run.sh" ]; then
+                install -m 755 "$BACKUP_PATH/xboard-node-run.sh" "$OPENRC_WRAPPER_PATH"
+            else
+                rm -f "$OPENRC_WRAPPER_PATH"
+            fi
         fi
         if [ -f "$BACKUP_PATH/${SERVICE_NAME}" ]; then
             install -m 644 "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
@@ -354,10 +362,12 @@ configure_service_manager() {
         SERVICE_MANAGER="openrc"
         SERVICE_NAME="xboard-node"
         SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
+        OPENRC_WRAPPER_PATH="${INSTALL_ROOT}/xboard-node-run.sh"
     else
         SERVICE_MANAGER="systemd"
         SERVICE_NAME="xboard-node.service"
         SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+        OPENRC_WRAPPER_PATH=""
     fi
 }
 
@@ -764,11 +774,12 @@ EOF_UNIT
 #!/sbin/openrc-run
 name="Xboard Node Backend"
 description="Xboard Node Backend"
-command="${BINARY_PATH}"
+command="${OPENRC_WRAPPER_PATH}"
 directory="${INSTALL_ROOT}"
 pidfile="/run/xboard-node.pid"
 output_log="/var/log/xboard-node.log"
 error_log="/var/log/xboard-node.err"
+command_background="yes"
 
 depend() {
     need net
@@ -785,30 +796,24 @@ start_pre() {
         set +a
     fi
 }
-
-start() {
-    ebegin "Starting \${name}"
-    start_pre
-    start-stop-daemon --start \\
-        --background \\
-        --make-pidfile \\
-        --pidfile "\${pidfile}" \\
-        --chdir "\${directory}" \\
-        --stdout "\${output_log}" \\
-        --stderr "\${error_log}" \\
-        --exec "\${command}" \\
-        -- -c "${CONFIG_FILE}"
-    eend \$?
-}
-
-stop() {
-    ebegin "Stopping \${name}"
-    start-stop-daemon --stop --pidfile "\${pidfile}"
-    eend \$?
-}
 EOF_INIT
             ;;
     esac
+}
+
+render_openrc_wrapper() {
+    cat >"$TMP_DIR/xboard-node-run.sh" <<EOF_WRAPPER
+#!/bin/sh
+set -eu
+
+if [ -f "${CREDENTIALS_FILE}" ]; then
+    set -a
+    . "${CREDENTIALS_FILE}"
+    set +a
+fi
+
+exec "${BINARY_PATH}" -c "${CONFIG_FILE}"
+EOF_WRAPPER
 }
 
 backup_existing_state() {
@@ -819,6 +824,9 @@ backup_existing_state() {
     fi
     if [ -x "$CLI_PATH" ]; then
         cp "$CLI_PATH" "$BACKUP_PATH/xbctl"
+    fi
+    if [ -n "$OPENRC_WRAPPER_PATH" ] && [ -f "$OPENRC_WRAPPER_PATH" ]; then
+        cp "$OPENRC_WRAPPER_PATH" "$BACKUP_PATH/xboard-node-run.sh"
     fi
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
@@ -855,6 +863,7 @@ install_staged_files() {
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        install -m 755 "$TMP_DIR/xboard-node-run.sh" "$OPENRC_WRAPPER_PATH"
         install -m 755 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     else
         install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
@@ -915,6 +924,9 @@ perform_install() {
     ensure_dirs
     stage_binary
     stage_xbctl
+    if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        render_openrc_wrapper
+    fi
     render_config
     render_service
     backup_existing_state
@@ -942,6 +954,9 @@ perform_upgrade() {
     ensure_dirs
     stage_binary
     stage_xbctl
+    if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        render_openrc_wrapper
+    fi
     render_service
     backup_existing_state
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
@@ -985,6 +1000,7 @@ perform_uninstall() {
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
     rm -f /usr/bin/xbctl 2>/dev/null || true
+    rm -f "$OPENRC_WRAPPER_PATH" 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
         log_info "Removed ${INSTALL_ROOT}"
