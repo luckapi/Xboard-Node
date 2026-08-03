@@ -744,9 +744,10 @@ render_config() {
 }
 
 render_service() {
+    local staged_service="$TMP_DIR/service-${SERVICE_NAME}"
     case "$SERVICE_MANAGER" in
         systemd)
-            cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
+            cat >"$staged_service" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
 Documentation=https://github.com/cedar2025/xboard-node
@@ -770,7 +771,7 @@ WantedBy=multi-user.target
 EOF_UNIT
             ;;
         openrc)
-            cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_INIT
+            cat >"$staged_service" <<EOF_INIT
 #!/sbin/openrc-run
 name="Xboard Node Backend"
 description="Xboard Node Backend"
@@ -865,9 +866,9 @@ install_staged_files() {
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     if [ "$SERVICE_MANAGER" = "openrc" ]; then
         install -m 755 "$TMP_DIR/xboard-node-run.sh" "$OPENRC_WRAPPER_PATH"
-        install -m 755 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+        install -m 755 "$TMP_DIR/service-${SERVICE_NAME}" "$SERVICE_PATH"
     else
-        install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+        install -m 644 "$TMP_DIR/service-${SERVICE_NAME}" "$SERVICE_PATH"
     fi
     service_manager_reload
     service_enable
@@ -964,9 +965,10 @@ perform_upgrade() {
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     if [ "$SERVICE_MANAGER" = "openrc" ]; then
-        install -m 755 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+        install -m 755 "$TMP_DIR/xboard-node-run.sh" "$OPENRC_WRAPPER_PATH"
+        install -m 755 "$TMP_DIR/service-${SERVICE_NAME}" "$SERVICE_PATH"
     else
-        install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+        install -m 644 "$TMP_DIR/service-${SERVICE_NAME}" "$SERVICE_PATH"
     fi
     service_manager_reload
     service_restart
