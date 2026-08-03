@@ -31,16 +31,19 @@ vim config/config.yml   # set panel.url / token / node_id
 docker compose up -d
 ```
 
-### Installer (Linux systemd)
+### Installer (Linux systemd / Alpine OpenRC)
 
 ```bash
 # Node mode
-curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/luckapi/xboard-node/dev/install.sh | \
   sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1
 
 # Machine mode
-curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/luckapi/xboard-node/dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
+```
+
+The installer uses systemd on Debian/Ubuntu/RHEL-family hosts and OpenRC on Alpine.
 
 ## xbctl
 

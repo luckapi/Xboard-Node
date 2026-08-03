@@ -17,6 +17,7 @@ CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
 BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_MANAGER="systemd"
 CLI_PATH="/usr/local/bin/xbctl"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 CLI_BINARY_SOURCE=""
@@ -127,17 +128,19 @@ rollback_install() {
         fi
     fi
     load_health_port_from_config "$CONFIG_FILE"
-    systemctl daemon-reload || true
+    service_manager_reload || true
     if [ "$SERVICE_EXISTED" -eq 1 ] || [ -f "$SERVICE_PATH" ]; then
-        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
-        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if [ "$SERVICE_MANAGER" = "systemd" ]; then
+            systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        service_restart >/dev/null 2>&1 || true
         if ! wait_for_health; then
             log_error "Rollback completed but restored service did not become healthy"
             show_recent_logs
             return 1
         fi
     else
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        service_disable >/dev/null 2>&1 || true
     fi
     log_warn "Rollback complete"
 }
@@ -346,15 +349,100 @@ detect_os() {
     fi
 }
 
-ensure_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "systemd is required for this installer"
-        exit 1
+configure_service_manager() {
+    if [ "$OS" = "alpine" ]; then
+        SERVICE_MANAGER="openrc"
+        SERVICE_NAME="xboard-node"
+        SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
+    else
+        SERVICE_MANAGER="systemd"
+        SERVICE_NAME="xboard-node.service"
+        SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
     fi
-    if [ ! -d /run/systemd/system ]; then
-        log_error "This host does not appear to be running systemd"
-        exit 1
-    fi
+}
+
+ensure_service_manager() {
+    case "$SERVICE_MANAGER" in
+        systemd)
+            if ! command -v systemctl >/dev/null 2>&1; then
+                log_error "systemd is required for this installer"
+                exit 1
+            fi
+            if [ ! -d /run/systemd/system ]; then
+                log_error "This host does not appear to be running systemd"
+                exit 1
+            fi
+            ;;
+        openrc)
+            if ! command -v rc-service >/dev/null 2>&1 || ! command -v rc-update >/dev/null 2>&1; then
+                log_error "OpenRC is required for Alpine installs"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+service_manager_reload() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl daemon-reload ;;
+        openrc) return 0 ;;
+    esac
+}
+
+service_is_active() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_is_enabled() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc) rc-update show default 2>/dev/null | awk '{print $1}' | grep -qx "$SERVICE_NAME" ;;
+    esac
+}
+
+service_enable() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc) rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+    esac
+}
+
+service_disable() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+    esac
+}
+
+service_start() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl start "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" start ;;
+    esac
+}
+
+service_stop() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl stop "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" stop ;;
+    esac
+}
+
+service_restart() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl restart "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" restart ;;
+    esac
+}
+
+service_status() {
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl status "$SERVICE_NAME" --no-pager ;;
+        openrc) rc-service "$SERVICE_NAME" status ;;
+    esac
 }
 
 run_with_retry() {
@@ -406,8 +494,35 @@ install_debian_dependencies() {
     fi
 }
 
+install_alpine_dependencies() {
+    run_with_retry 5 3 apk update -q
+
+    local packages=()
+    if ! command -v curl >/dev/null 2>&1; then
+        packages+=(curl)
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        packages+=(wget)
+    fi
+    if ! apk info -e ca-certificates >/dev/null 2>&1; then
+        packages+=(ca-certificates)
+    fi
+    if ! command -v rc-service >/dev/null 2>&1 || ! command -v rc-update >/dev/null 2>&1; then
+        packages+=(openrc)
+    fi
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    run_with_retry 5 3 apk add --no-cache "${packages[@]}"
+}
+
 install_dependencies() {
     case "$OS" in
+        alpine)
+            install_alpine_dependencies
+            ;;
         ubuntu|debian)
             install_debian_dependencies
             ;;
@@ -619,7 +734,9 @@ render_config() {
 }
 
 render_service() {
-    cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
+    case "$SERVICE_MANAGER" in
+        systemd)
+            cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
 Documentation=https://github.com/cedar2025/xboard-node
@@ -641,6 +758,38 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF_UNIT
+            ;;
+        openrc)
+            cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_INIT
+#!/sbin/openrc-run
+name="Xboard Node Backend"
+description="Xboard Node Backend"
+command="${BINARY_PATH}"
+command_args="-c ${CONFIG_FILE}"
+command_background="yes"
+directory="${INSTALL_ROOT}"
+pidfile="/run/xboard-node.pid"
+output_log="/var/log/xboard-node.log"
+error_log="/var/log/xboard-node.err"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root /run
+    checkpath -f -m 0644 -o root:root "\${output_log}"
+    checkpath -f -m 0644 -o root:root "\${error_log}"
+    if [ -f "${CREDENTIALS_FILE}" ]; then
+        set -a
+        . "${CREDENTIALS_FILE}"
+        set +a
+    fi
+}
+EOF_INIT
+            ;;
+    esac
 }
 
 backup_existing_state() {
@@ -670,8 +819,8 @@ backup_existing_state() {
 }
 
 stop_existing_service() {
-    if [ -f "$SERVICE_PATH" ] || systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if [ -f "$SERVICE_PATH" ] || service_is_active; then
+        service_stop >/dev/null 2>&1 || true
     fi
 }
 
@@ -686,13 +835,17 @@ install_staged_files() {
     fi
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
-    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        install -m 755 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    else
+        install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    fi
+    service_manager_reload
+    service_enable
 }
 
 wait_for_health() {
-    if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    if ! service_is_active; then
         return 1
     fi
     if [ "$HEALTH_ENABLED" -eq 0 ]; then
@@ -701,7 +854,7 @@ wait_for_health() {
     local attempt=0
     local max_attempts=30
     while [ "$attempt" -lt "$max_attempts" ]; do
-        if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        if ! service_is_active; then
             return 1
         fi
         if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
@@ -714,16 +867,19 @@ wait_for_health() {
 }
 
 show_recent_logs() {
-    if command -v journalctl >/dev/null 2>&1; then
+    if [ "$SERVICE_MANAGER" = "systemd" ] && command -v journalctl >/dev/null 2>&1; then
         journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        [ -f /var/log/xboard-node.log ] && tail -n 30 /var/log/xboard-node.log || true
+        [ -f /var/log/xboard-node.err ] && tail -n 30 /var/log/xboard-node.err || true
     fi
 }
 
 start_service() {
-    if systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1; then
-        systemctl restart "$SERVICE_NAME"
+    if service_is_enabled; then
+        service_restart
     else
-        systemctl start "$SERVICE_NAME"
+        service_start
     fi
     if ! wait_for_health; then
         log_error "Service failed health check"
@@ -772,9 +928,13 @@ perform_upgrade() {
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
-    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
-    systemctl daemon-reload
-    systemctl restart "$SERVICE_NAME"
+    if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        install -m 755 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    else
+        install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    fi
+    service_manager_reload
+    service_restart
     if ! wait_for_health; then
         log_error "Upgrade health check failed"
         show_recent_logs
@@ -798,10 +958,10 @@ confirm_uninstall() {
 perform_uninstall() {
     confirm_uninstall
     if [ -f "$SERVICE_PATH" ]; then
-        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        service_stop >/dev/null 2>&1 || true
+        service_disable >/dev/null 2>&1 || true
         rm -f "$SERVICE_PATH"
-        systemctl daemon-reload || true
+        service_manager_reload || true
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
@@ -837,7 +997,7 @@ perform_status() {
     fi
     if [ -f "$SERVICE_PATH" ]; then
         echo "  service: ${SERVICE_NAME}"
-        systemctl status "$SERVICE_NAME" --no-pager || true
+        service_status || true
     fi
 }
 
@@ -849,7 +1009,9 @@ main() {
             exit 0
             ;;
         status)
-            ensure_systemd
+            detect_os
+            configure_service_manager
+            ensure_service_manager
             perform_status
             exit 0
             ;;
@@ -858,8 +1020,9 @@ main() {
     check_root
     detect_arch
     detect_os
-    ensure_systemd
     install_dependencies
+    configure_service_manager
+    ensure_service_manager
 
     case "$ACTION" in
         install)
