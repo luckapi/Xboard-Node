@@ -765,8 +765,6 @@ EOF_UNIT
 name="Xboard Node Backend"
 description="Xboard Node Backend"
 command="${BINARY_PATH}"
-command_args="-c ${CONFIG_FILE}"
-command_background="yes"
 directory="${INSTALL_ROOT}"
 pidfile="/run/xboard-node.pid"
 output_log="/var/log/xboard-node.log"
@@ -786,6 +784,27 @@ start_pre() {
         . "${CREDENTIALS_FILE}"
         set +a
     fi
+}
+
+start() {
+    ebegin "Starting \${name}"
+    start_pre
+    start-stop-daemon --start \\
+        --background \\
+        --make-pidfile \\
+        --pidfile "\${pidfile}" \\
+        --chdir "\${directory}" \\
+        --stdout "\${output_log}" \\
+        --stderr "\${error_log}" \\
+        --exec "\${command}" \\
+        -- -c "${CONFIG_FILE}"
+    eend \$?
+}
+
+stop() {
+    ebegin "Stopping \${name}"
+    start-stop-daemon --stop --pidfile "\${pidfile}"
+    eend \$?
 }
 EOF_INIT
             ;;
