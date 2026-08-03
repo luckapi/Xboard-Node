@@ -757,7 +757,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_ROOT}
 EnvironmentFile=-${CREDENTIALS_FILE}
-ExecStart=${BINARY_PATH} -c ${CONFIG_FILE}
+ExecStart=${BINARY_PATH}
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -812,7 +812,8 @@ if [ -f "${CREDENTIALS_FILE}" ]; then
     set +a
 fi
 
-exec "${BINARY_PATH}" -c "${CONFIG_FILE}"
+cd "${INSTALL_ROOT}"
+exec "${BINARY_PATH}"
 EOF_WRAPPER
 }
 
