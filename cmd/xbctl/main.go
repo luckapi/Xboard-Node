@@ -29,6 +29,10 @@ const (
 	defaultCLIPath         = "/usr/local/bin/xbctl"
 	serviceName            = "xboard-node.service"
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
+	openRCServiceName      = "xboard-node"
+	openRCServiceFilePath  = "/etc/init.d/xboard-node"
+	openRCOutputLogPath    = "/var/log/xboard-node.log"
+	openRCErrorLogPath     = "/var/log/xboard-node.err"
 	defaultInstallRoot     = "/etc/xboard-node"
 	downloadBase           = "https://github.com/cedar2025/xboard-node/releases"
 )
@@ -296,19 +300,96 @@ func runService(args []string) error {
 	}
 	sub := args[0]
 	rest := args[1:]
+	if isOpenRC() {
+		switch sub {
+		case "status":
+			return runPrivilegedCommand("rc-service", append([]string{openRCServiceName, "status"}, rest...)...)
+		case "start", "stop", "restart":
+			return runPrivilegedCommand("rc-service", append([]string{openRCServiceName, sub}, rest...)...)
+		case "enable":
+			return runPrivilegedCommand("rc-update", append([]string{"add", openRCServiceName, "default"}, rest...)...)
+		case "disable":
+			return runPrivilegedCommand("rc-update", append([]string{"del", openRCServiceName, "default"}, rest...)...)
+		case "logs":
+			if len(rest) == 0 {
+				rest = []string{"-n", "50", "-f"}
+			}
+			rest = append(rest, openRCOutputLogPath, openRCErrorLogPath)
+			return runPrivilegedCommand("tail", rest...)
+		default:
+			return fmt.Errorf("unknown service command: %s", sub)
+		}
+	}
 	switch sub {
 	case "status":
-		return runCommand("sudo", append([]string{"systemctl", "status", serviceName, "--no-pager"}, rest...)...)
+		return runPrivilegedCommand("systemctl", append([]string{"status", serviceName, "--no-pager"}, rest...)...)
 	case "start", "stop", "restart", "enable", "disable":
-		return runCommand("sudo", append([]string{"systemctl", sub, serviceName}, rest...)...)
+		return runPrivilegedCommand("systemctl", append([]string{sub, serviceName}, rest...)...)
 	case "logs":
 		if len(rest) == 0 {
 			rest = []string{"-f"}
 		}
-		return runCommand("sudo", append([]string{"journalctl", "-u", serviceName}, rest...)...)
+		return runPrivilegedCommand("journalctl", append([]string{"-u", serviceName}, rest...)...)
 	default:
 		return fmt.Errorf("unknown service command: %s", sub)
 	}
+}
+
+func isOpenRC() bool {
+	if !fileExists("/sbin/openrc-run") {
+		return false
+	}
+	_, err := exec.LookPath("rc-service")
+	return err == nil
+}
+
+func activeServiceFilePath() string {
+	if isOpenRC() {
+		return openRCServiceFilePath
+	}
+	return serviceFilePath
+}
+
+func serviceRestart() error {
+	if isOpenRC() {
+		return runCommand("rc-service", openRCServiceName, "restart")
+	}
+	return runCommand("systemctl", "restart", serviceName)
+}
+
+func serviceStop() error {
+	if isOpenRC() {
+		return runCommand("rc-service", openRCServiceName, "stop")
+	}
+	return runCommand("systemctl", "stop", serviceName)
+}
+
+func serviceEnable() error {
+	if isOpenRC() {
+		return runCommand("rc-update", "add", openRCServiceName, "default")
+	}
+	return runCommand("systemctl", "enable", serviceName)
+}
+
+func serviceDisable() error {
+	if isOpenRC() {
+		return runCommand("rc-update", "del", openRCServiceName, "default")
+	}
+	return runCommand("systemctl", "disable", serviceName)
+}
+
+func serviceManagerReload() error {
+	if isOpenRC() {
+		return nil
+	}
+	return runCommand("systemctl", "daemon-reload")
+}
+
+func runPrivilegedCommand(name string, args ...string) error {
+	if os.Geteuid() == 0 {
+		return runCommand(name, args...)
+	}
+	return runCommand("sudo", append([]string{name}, args...)...)
 }
 
 func runHealth() error {
@@ -375,7 +456,7 @@ func runBindAdd(mode string, args []string) error {
 	}
 	// Restart service to pick up new config
 	fmt.Println("Restarting service...")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := serviceRestart(); err != nil {
 		return fmt.Errorf("service restart failed: %w", err)
 	}
 	fmt.Println("Binding added successfully")
@@ -469,8 +550,8 @@ func runUpgrade(args []string) error {
 
 	// Restart service
 	fmt.Println("Restarting service...")
-	runCommand("systemctl", "daemon-reload")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	serviceManagerReload()
+	if err := serviceRestart(); err != nil {
 		fmt.Println("Restart failed, rolling back...")
 		rollbackOK := true
 		if fileExists(backupBinary) {
@@ -485,8 +566,8 @@ func runUpgrade(args []string) error {
 				rollbackOK = false
 			}
 		}
-		runCommand("systemctl", "daemon-reload")
-		if e := runCommand("systemctl", "restart", serviceName); e != nil {
+		serviceManagerReload()
+		if e := serviceRestart(); e != nil {
 			return fmt.Errorf("upgrade and rollback restart both failed: %w", e)
 		}
 		if rollbackOK {
@@ -542,17 +623,17 @@ func runUninstall(args []string) error {
 	var warnings []string
 
 	// Stop and disable service
-	if fileExists(serviceFilePath) {
-		if err := runCommand("systemctl", "stop", serviceName); err != nil {
+	if fileExists(activeServiceFilePath()) {
+		if err := serviceStop(); err != nil {
 			warnings = append(warnings, fmt.Sprintf("stop service: %v", err))
 		}
-		if err := runCommand("systemctl", "disable", serviceName); err != nil {
+		if err := serviceDisable(); err != nil {
 			warnings = append(warnings, fmt.Sprintf("disable service: %v", err))
 		}
-		if err := os.Remove(serviceFilePath); err != nil {
+		if err := os.Remove(activeServiceFilePath()); err != nil {
 			warnings = append(warnings, fmt.Sprintf("remove service file: %v", err))
 		}
-		runCommand("systemctl", "daemon-reload")
+		serviceManagerReload()
 	}
 
 	// Remove binaries
@@ -783,7 +864,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 			return err
 		}
-		runCommand("systemctl", "stop", serviceName)
+		serviceStop()
 		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
 		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
@@ -801,7 +882,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 		return err
 	}
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := serviceRestart(); err != nil {
 		return err
 	}
 	fmt.Printf("removed %d binding(s)\n", len(removed))
@@ -1075,6 +1156,13 @@ func printRows(rows []instanceRow, output string) error {
 }
 
 func systemctlState() string {
+	if isOpenRC() {
+		cmd := exec.Command("rc-service", openRCServiceName, "status")
+		if err := cmd.Run(); err == nil {
+			return "active"
+		}
+		return "inactive"
+	}
 	cmd := exec.Command("systemctl", "is-active", serviceName)
 	out, err := cmd.CombinedOutput()
 	state := strings.TrimSpace(string(out))
