@@ -126,33 +126,35 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 		}()
 	}
 
-	if len(alive) > 0 {
-		a := aliveMapPool.Get().(map[string][]string)
-		for uid, ips := range alive {
-			a[strconv.Itoa(uid)] = ips
-		}
-		payload["alive"] = a
-		defer func() {
-			for k := range a {
-				delete(a, k)
-			}
-			aliveMapPool.Put(a)
-		}()
+	a := aliveMapPool.Get().(map[string][]string)
+	for k := range a {
+		delete(a, k)
 	}
+	for uid, ips := range alive {
+		a[strconv.Itoa(uid)] = ips
+	}
+	payload["alive"] = a
+	defer func() {
+		for k := range a {
+			delete(a, k)
+		}
+		aliveMapPool.Put(a)
+	}()
 
-	if len(online) > 0 {
-		o := onlineMapPool.Get().(map[string]int)
-		for uid, count := range online {
-			o[strconv.Itoa(uid)] = count
-		}
-		payload["online"] = o
-		defer func() {
-			for k := range o {
-				delete(o, k)
-			}
-			onlineMapPool.Put(o)
-		}()
+	o := onlineMapPool.Get().(map[string]int)
+	for k := range o {
+		delete(o, k)
 	}
+	for uid, count := range online {
+		o[strconv.Itoa(uid)] = count
+	}
+	payload["online"] = o
+	defer func() {
+		for k := range o {
+			delete(o, k)
+		}
+		onlineMapPool.Put(o)
+	}()
 
 	status := map[string]interface{}{
 		"cpu":  cpu,
@@ -294,9 +296,6 @@ func (c *Client) PushTraffic(data map[int][2]int64) error {
 
 // PushAlive submits online user IPs
 func (c *Client) PushAlive(data map[int][]string) error {
-	if len(data) == 0 {
-		return nil
-	}
 	payload := make(map[string]interface{}, len(data))
 	for uid, ips := range data {
 		payload[strconv.Itoa(uid)] = ips

@@ -220,6 +220,81 @@ func TestPushAlive_Success(t *testing.T) {
 	}
 }
 
+func TestPushAlive_EmptySendsClearPayload(t *testing.T) {
+	var received map[string]interface{}
+	client := NewClient(config.PanelConfig{URL: "http://panel.example", Token: "test-token", NodeID: 1})
+	client.httpClient = &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/v1/server/UniProxy/alive" {
+				t.Errorf("unexpected path: %s", req.URL.Path)
+			}
+			if err := json.NewDecoder(req.Body).Decode(&received); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       http.NoBody,
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	if err := client.PushAlive(nil); err != nil {
+		t.Fatalf("PushAlive nil: %v", err)
+	}
+	if received["token"] != "test-token" {
+		t.Fatalf("expected auth token in payload, got %v", received["token"])
+	}
+	if received["node_id"] != float64(1) {
+		t.Fatalf("expected node_id in payload, got %v", received["node_id"])
+	}
+}
+
+func TestReport_IncludesEmptyAliveAndOnline(t *testing.T) {
+	var received map[string]interface{}
+	client := NewClient(config.PanelConfig{URL: "http://panel.example", Token: "test-token", NodeID: 1})
+	client.httpClient = &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/v2/server/report" {
+				t.Errorf("unexpected path: %s", req.URL.Path)
+			}
+			if err := json.NewDecoder(req.Body).Decode(&received); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       http.NoBody,
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	if err := client.Report(nil, nil, nil, 12.5, [2]uint64{8, 4}, [2]uint64{2, 1}, [2]uint64{100, 50}, nil); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if _, ok := received["alive"]; !ok {
+		t.Fatal("expected alive field in report payload")
+	}
+	if _, ok := received["online"]; !ok {
+		t.Fatal("expected online field in report payload")
+	}
+	if alive, ok := received["alive"].(map[string]interface{}); !ok || len(alive) != 0 {
+		t.Fatalf("expected empty alive payload, got %#v", received["alive"])
+	}
+	if online, ok := received["online"].(map[string]interface{}); !ok || len(online) != 0 {
+		t.Fatalf("expected empty online payload, got %#v", received["online"])
+	}
+	if received["token"] != "test-token" {
+		t.Fatalf("expected auth token in report payload, got %v", received["token"])
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestPushStatus_Success(t *testing.T) {
 	var received map[string]interface{}
 	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
