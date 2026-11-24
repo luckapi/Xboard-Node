@@ -1,11 +1,13 @@
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git patch
 
 WORKDIR /build
 
 COPY go.mod go.sum ./
+COPY scripts ./scripts
+RUN GO111MODULE=off go run scripts/prepare-kernels.go
 RUN go mod download
 
 COPY . .

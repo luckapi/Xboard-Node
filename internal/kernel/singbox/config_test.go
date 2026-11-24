@@ -70,8 +70,9 @@ func TestBuildInbound_VMess(t *testing.T) {
 	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{})
 	assertMapValue(t, inbound, "type", "vmess")
 	assertMapValue(t, inbound, "tag", "vmess-in")
-	assertMapValue(t, inbound, "sniff", true)
-	assertMapValue(t, inbound, "sniff_override_destination", true)
+	if _, ok := inbound["sniff"]; ok {
+		t.Fatal("sniffing must use route actions, not removed legacy inbound fields")
+	}
 
 	users := inbound["users"].([]M)
 	assertMapValue(t, users[0], "uuid", "aaaaaaaa-1111-2222-3333-444444444444")

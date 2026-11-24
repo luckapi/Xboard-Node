@@ -1,0 +1,1455 @@
+diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
+index bafb15d..8c634e8 100644
+--- a/adapter/inbound/manager.go
++++ b/adapter/inbound/manager.go
+@@ -2,6 +2,7 @@ package inbound
+ 
+ import (
+ 	"context"
++	"slices"
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -12,6 +13,8 @@ import (
+ var _ adapter.InboundManager = (*Manager)(nil)
+ 
+ type Manager struct {
++	scope        *adapter.Scope
++	stage        adapter.StartStage
+ 	registry     adapter.InboundRegistry
+ 	endpoint     adapter.EndpointManager
+ 	access       sync.Mutex
+@@ -29,7 +32,9 @@ func NewManager(registry adapter.InboundRegistry, endpoint adapter.EndpointManag
+ 
+ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	m.access.Lock()
+-	inbounds := m.inbounds
++	m.scope = scope
++	m.stage = stage
++	inbounds := append([]adapter.Inbound(nil), m.inbounds...)
+ 	m.access.Unlock()
+ 	for _, inbound := range inbounds {
+ 		name := "inbound/" + inbound.Type() + "[" + inbound.Tag() + "]"
+@@ -44,7 +49,7 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ func (m *Manager) Inbounds() []adapter.Inbound {
+ 	m.access.Lock()
+ 	defer m.access.Unlock()
+-	return m.inbounds
++	return append([]adapter.Inbound(nil), m.inbounds...)
+ }
+ 
+ func (m *Manager) Get(tag string) (adapter.Inbound, bool) {
+@@ -70,5 +75,46 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 	}
+ 	m.inbounds = append(m.inbounds, inbound)
+ 	m.inboundByTag[tag] = inbound
++	if m.scope != nil {
++		for _, stage := range adapter.ListStartStages {
++			if stage > m.stage {
++				break
++			}
++			if err := m.scope.Start("inbound/"+inbound.Type()+"["+tag+"]", inbound, stage); err != nil {
++				delete(m.inboundByTag, tag)
++				m.inbounds = m.inbounds[:len(m.inbounds)-1]
++				_ = m.scope.CloseComponent(inbound)
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (m *Manager) Remove(tag string) error {
++	m.access.Lock()
++	inbound, found := m.inboundByTag[tag]
++	if !found {
++		m.access.Unlock()
++		return E.New("inbound not found: ", tag)
++	}
++	delete(m.inboundByTag, tag)
++	m.inbounds = slices.DeleteFunc(m.inbounds, func(it adapter.Inbound) bool { return it == inbound })
++	scope := m.scope
++	m.access.Unlock()
++	if scope != nil {
++		return scope.CloseComponent(inbound)
++	}
+ 	return nil
+ }
++
++func (m *Manager) Close() error {
++	m.access.Lock()
++	inbounds := append([]adapter.Inbound(nil), m.inbounds...)
++	m.access.Unlock()
++	var errs []error
++	for _, inbound := range inbounds {
++		errs = append(errs, m.Remove(inbound.Tag()))
++	}
++	return E.Errors(errs...)
++}
+diff --git a/adapter/inbound.go b/adapter/inbound.go
+index 3027f1e..4a57e07 100644
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -22,6 +22,16 @@ type Inbound interface {
+ 	Tag() string
+ }
+ 
++type UpdatableInbound[T any] interface {
++	Inbound
++	UpdateUsers(users []T) error
++}
++
++type UpdatableShadowsocksInbound interface {
++	Inbound
++	UpdateUsersByOptions(users []option.ShadowsocksUser) error
++}
++
+ type TCPInjectableInbound interface {
+ 	Inbound
+ 	ConnectionHandler
+@@ -39,6 +49,8 @@ type InboundRegistry interface {
+ 
+ type InboundManager interface {
+ 	Lifecycle
++	Close() error
++	Remove(tag string) error
+ 	Inbounds() []Inbound
+ 	Get(tag string) (Inbound, bool)
+ 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
+diff --git a/adapter/lifecycle.go b/adapter/lifecycle.go
+index 1e9922e..d2df5c7 100644
+--- a/adapter/lifecycle.go
++++ b/adapter/lifecycle.go
+@@ -64,10 +64,15 @@ type Scope struct {
+ 	cancel   context.CancelFunc
+ 	logger   log.ContextLogger
+ 	access   sync.Mutex
+-	cleanups []func() error
++	cleanups []scopeCleanup
+ 	children map[Lifecycle]*Scope
+ }
+ 
++type scopeCleanup struct {
++	component Lifecycle
++	run       func() error
++}
++
+ func NewScope(ctx context.Context, logger log.ContextLogger) *Scope {
+ 	ctx, cancel := context.WithCancel(ctx)
+ 	return &Scope{
+@@ -84,7 +89,7 @@ func (s *Scope) Context() context.Context {
+ 
+ func (s *Scope) Add(cleanup func() error) {
+ 	s.access.Lock()
+-	s.cleanups = append(s.cleanups, cleanup)
++	s.cleanups = append(s.cleanups, scopeCleanup{run: cleanup})
+ 	s.access.Unlock()
+ }
+ 
+@@ -99,7 +104,7 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error
+ 	if !loaded {
+ 		child = NewScope(s.ctx, s.logger)
+ 		s.children[component] = child
+-		s.cleanups = append(s.cleanups, func() error {
++		s.cleanups = append(s.cleanups, scopeCleanup{component: component, run: func() error {
+ 			done := LogElapsed(s.logger, "close ", name)
+ 			monitor := taskmonitor.New(s.logger, C.StopTimeout)
+ 			monitor.Start("close ", name)
+@@ -110,7 +115,7 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error
+ 				return E.Cause(closeErr, "close ", name)
+ 			}
+ 			return nil
+-		})
++		}})
+ 	}
+ 	s.access.Unlock()
+ 	done := LogElapsed(s.logger, stage, " ", name)
+@@ -134,13 +139,31 @@ func (s *Scope) Close() error {
+ 	s.access.Unlock()
+ 	var cleanupErrors []error
+ 	for _, cleanup := range slices.Backward(cleanups) {
+-		cleanupErrors = append(cleanupErrors, E.Expand(cleanup())...)
++		cleanupErrors = append(cleanupErrors, E.Expand(cleanup.run())...)
+ 	}
+ 	return E.Errors(common.Filter(cleanupErrors, func(it error) bool {
+ 		return !E.IsClosed(it) && !E.IsCanceled(it)
+ 	})...)
+ }
+ 
++// CloseComponent releases a dynamically removed component and its cleanup entry.
++func (s *Scope) CloseComponent(component Lifecycle) error {
++	s.access.Lock()
++	child := s.children[component]
++	delete(s.children, component)
++	for i, cleanup := range s.cleanups {
++		if cleanup.component == component {
++			s.cleanups = slices.Delete(s.cleanups, i, i+1)
++			break
++		}
++	}
++	s.access.Unlock()
++	if child != nil {
++		return child.Close()
++	}
++	return nil
++}
++
+ func LogElapsed(logger log.ContextLogger, description ...any) func() {
+ 	prefix := F.ToString(description...)
+ 	startTime := time.Now()
+diff --git a/adapter/lifecycle_xboard_test.go b/adapter/lifecycle_xboard_test.go
+new file mode 100644
+index 0000000..18eadab
+--- /dev/null
++++ b/adapter/lifecycle_xboard_test.go
+@@ -0,0 +1,39 @@
++package adapter
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/log"
++)
++
++type xboardTestComponent struct{ closes int }
++
++func (c *xboardTestComponent) Start(stage StartStage, scope *Scope) error {
++	if stage == StartStateStart {
++		scope.Add(func() error { c.closes++; return nil })
++	}
++	return nil
++}
++
++func TestXboardDynamicComponentCleanup(t *testing.T) {
++	scope := NewScope(context.Background(), log.NewNOPFactory().NewLogger("test"))
++	for range 10 {
++		component := new(xboardTestComponent)
++		if err := scope.Start("inbound", component, StartStateStart); err != nil {
++			t.Fatal(err)
++		}
++		if err := scope.CloseComponent(component); err != nil {
++			t.Fatal(err)
++		}
++		if component.closes != 1 {
++			t.Fatalf("cleanup calls = %d", component.closes)
++		}
++		if len(scope.children) != 0 || len(scope.cleanups) != 0 {
++			t.Fatal("removed inbound retained lifecycle resources")
++		}
++	}
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/adapter/router.go b/adapter/router.go
+index be62674..72930ef 100644
+--- a/adapter/router.go
++++ b/adapter/router.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/netip"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing-tun"
+ 	"github.com/sagernet/sing-tun/gtcpip/header"
+ 	M "github.com/sagernet/sing/common/metadata"
+@@ -28,6 +29,7 @@ type Router interface {
+ 	NeighborResolver() NeighborResolver
+ 	AppendTracker(tracker ConnectionTracker)
+ 	ResetNetwork()
++	UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) error
+ }
+ 
+ type PreMatchAction uint8
+diff --git a/constant/proxy.go b/constant/proxy.go
+index d42e5d9..9e84952 100644
+--- a/constant/proxy.go
++++ b/constant/proxy.go
+@@ -22,6 +22,7 @@ const (
+ 	TypeSSH                = "ssh"
+ 	TypeShadowTLS          = "shadowtls"
+ 	TypeAnyTLS             = "anytls"
++	TypeMieru              = "mieru"
+ 	TypeShadowsocksR       = "shadowsocksr"
+ 	TypeVLESS              = "vless"
+ 	TypeTUIC               = "tuic"
+@@ -52,6 +53,8 @@ const (
+ 
+ func ProxyDisplayName(proxyType string) string {
+ 	switch proxyType {
++	case TypeMieru:
++		return "Mieru"
+ 	case TypeTun:
+ 		return "TUN"
+ 	case TypeRedirect:
+diff --git a/include/registry.go b/include/registry.go
+index 9bb9220..4d6172a 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/direct"
+ 	"github.com/sagernet/sing-box/protocol/group"
+ 	"github.com/sagernet/sing-box/protocol/http"
++	"github.com/sagernet/sing-box/protocol/mieru"
+ 	"github.com/sagernet/sing-box/protocol/mixed"
+ 	"github.com/sagernet/sing-box/protocol/naive"
+ 	"github.com/sagernet/sing-box/protocol/redirect"
+@@ -69,6 +70,7 @@ func InboundRegistry() *inbound.Registry {
+ 	shadowtls.RegisterInbound(registry)
+ 	vless.RegisterInbound(registry)
+ 	anytls.RegisterInbound(registry)
++	mieru.RegisterInbound(registry)
+ 
+ 	registerQUICInbounds(registry)
+ 	registerCloudflaredInbound(registry)
+@@ -100,6 +102,7 @@ func OutboundRegistry() *outbound.Registry {
+ 	shadowtls.RegisterOutbound(registry)
+ 	vless.RegisterOutbound(registry)
+ 	anytls.RegisterOutbound(registry)
++	mieru.RegisterOutbound(registry)
+ 
+ 	registerQUICOutbounds(registry)
+ 	registerStubForRemovedOutbounds(registry)
+diff --git a/option/mieru.go b/option/mieru.go
+new file mode 100644
+index 0000000..a9ca4d1
+--- /dev/null
++++ b/option/mieru.go
+@@ -0,0 +1,26 @@
++package option
++
++import "github.com/sagernet/sing/common/json/badoption"
++
++type MieruOutboundOptions struct {
++	DialerOptions
++	ServerOptions
++	ServerPortRanges badoption.Listable[string] `json:"server_ports,omitempty"`
++	Transport        string                     `json:"transport,omitempty"`
++	UserName         string                     `json:"username,omitempty"`
++	Password         string                     `json:"password,omitempty"`
++	Multiplexing     string                     `json:"multiplexing,omitempty"`
++	TrafficPattern   string                     `json:"traffic_pattern,omitempty"`
++}
++
++type MieruInboundOptions struct {
++	ListenOptions
++	Users          []MieruUser `json:"users,omitempty"`
++	Transport      string      `json:"transport,omitempty"`
++	TrafficPattern string      `json:"traffic_pattern,omitempty"`
++}
++
++type MieruUser struct {
++	Name     string `json:"name,omitempty"`
++	Password string `json:"password,omitempty"`
++}
+diff --git a/protocol/anytls/user.go b/protocol/anytls/user.go
+new file mode 100644
+index 0000000..67d10e8
+--- /dev/null
++++ b/protocol/anytls/user.go
+@@ -0,0 +1,14 @@
++package anytls
++
++import (
++	anytls "github.com/anytls/sing-anytls"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *Inbound) UpdateUsers(users []option.AnyTLSUser) error {
++	h.service.UpdateUsers(common.Map(users, func(it option.AnyTLSUser) anytls.User {
++		return (anytls.User)(it)
++	}))
++	return nil
++}
+diff --git a/protocol/http/user.go b/protocol/http/user.go
+new file mode 100644
+index 0000000..9d41a57
+--- /dev/null
++++ b/protocol/http/user.go
+@@ -0,0 +1,10 @@
++package http
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (h *Inbound) UpdateUsers(users []auth.User) error {
++	h.authenticator = auth.NewAuthenticator(users)
++	return nil
++}
+diff --git a/protocol/hysteria2/user.go b/protocol/hysteria2/user.go
+new file mode 100644
+index 0000000..ce1dd3c
+--- /dev/null
++++ b/protocol/hysteria2/user.go
+@@ -0,0 +1,19 @@
++package hysteria2
++
++import (
++	"github.com/sagernet/sing-box/option"
++)
++
++func (h *Inbound) UpdateUsers(users []option.Hysteria2User) error {
++	userList := make([]int, 0, len(users))
++	userNameList := make([]string, 0, len(users))
++	userPasswordList := make([]string, 0, len(users))
++	for index, user := range users {
++		userList = append(userList, index)
++		userNameList = append(userNameList, user.Name)
++		userPasswordList = append(userPasswordList, user.Password)
++	}
++	h.service.UpdateUsers(userList, userPasswordList)
++	h.userNameList = userNameList
++	return nil
++}
+diff --git a/protocol/mieru/inbound.go b/protocol/mieru/inbound.go
+new file mode 100644
+index 0000000..3de996b
+--- /dev/null
++++ b/protocol/mieru/inbound.go
+@@ -0,0 +1,334 @@
++package mieru
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/common/listener"
++	"github.com/sagernet/sing-box/common/uot"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/buf"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mierucommon "github.com/enfein/mieru/v3/apis/common"
++	mieruconstant "github.com/enfein/mieru/v3/apis/constant"
++	mierumodel "github.com/enfein/mieru/v3/apis/model"
++	mieruserver "github.com/enfein/mieru/v3/apis/server"
++	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
++	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
++	"google.golang.org/protobuf/proto"
++)
++
++func RegisterInbound(registry *inbound.Registry) {
++	inbound.Register[option.MieruInboundOptions](registry, C.TypeMieru, NewInbound)
++}
++
++type Inbound struct {
++	inbound.Adapter
++	ctx       context.Context
++	router    adapter.ConnectionRouterEx
++	logger    log.ContextLogger
++	listener  *listener.Listener
++	server    mieruserver.Server
++	userNames []string
++
++	mu sync.Mutex
++}
++
++func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MieruInboundOptions) (adapter.Inbound, error) {
++	config, userNames, err := buildMieruServerConfig(ctx, options)
++	if err != nil {
++		return nil, fmt.Errorf("failed to build mieru server config: %w", err)
++	}
++
++	s := mieruserver.NewServer()
++	if err := s.Store(config); err != nil {
++		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
++	}
++
++	inboundInstance := &Inbound{
++		Adapter:   inbound.NewAdapter(C.TypeMieru, tag),
++		ctx:       ctx,
++		router:    uot.NewRouter(router, logger),
++		logger:    logger,
++		server:    s,
++		userNames: userNames,
++	}
++	inboundInstance.listener = listener.New(listener.Options{
++		Context: ctx,
++		Logger:  logger,
++		Network: []string{N.NetworkTCP, N.NetworkUDP},
++		Listen:  options.ListenOptions,
++	})
++
++	return inboundInstance, nil
++}
++
++func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	if stage != adapter.StartStateStart {
++		return nil
++	}
++
++	h.mu.Lock()
++	defer h.mu.Unlock()
++
++	if err := h.server.Start(); err != nil {
++		return fmt.Errorf("failed to start mieru server: %w", err)
++	}
++	scope.Add(h.Close)
++
++	h.logger.Info("mieru server is started")
++	go h.acceptLoop()
++	return nil
++}
++
++func (h *Inbound) Close() error {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++
++	if h.server.IsRunning() {
++		return h.server.Stop()
++	}
++	return nil
++}
++
++func (h *Inbound) acceptLoop() {
++	for {
++		conn, request, err := h.server.Accept()
++		if err != nil {
++			if !h.server.IsRunning() {
++				return
++			}
++			h.logger.Debug("failed to accept mieru connection: ", err)
++			continue
++		}
++		go h.handleConnection(conn, request)
++	}
++}
++
++func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
++	ctx := log.ContextWithNewID(h.ctx)
++
++	// Send fake SOCKS5 response back to proxy client.
++	resp := &mierumodel.Response{
++		Reply: mieruconstant.Socks5ReplySuccess,
++		BindAddr: mierumodel.AddrSpec{
++			IP:   net.IPv4zero,
++			Port: 0,
++		},
++	}
++	if err := resp.WriteToSocks5(conn); err != nil {
++		conn.Close()
++		h.logger.DebugContext(ctx, "failed to write mieru response: ", err)
++		return
++	}
++
++	// Build metadata.
++	var metadata adapter.InboundContext
++	metadata.Inbound = h.Tag()
++	metadata.InboundType = h.Type()
++	//nolint:staticcheck
++	metadata.InboundDetour = h.listener.ListenOptions().Detour
++	metadata.UDPDisableDomainUnmapping = h.listener.ListenOptions().UDPDisableDomainUnmapping
++
++	// Parse source address.
++	if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
++		metadata.Source = M.SocksaddrFromNet(remoteAddr)
++	}
++
++	// Parse destination from request.
++	if request.DstAddr.FQDN != "" {
++		metadata.Destination = M.Socksaddr{
++			Fqdn: request.DstAddr.FQDN,
++			Port: uint16(request.DstAddr.Port),
++		}
++	} else if request.DstAddr.IP != nil {
++		addr, _ := netip.AddrFromSlice(request.DstAddr.IP)
++		metadata.Destination = M.Socksaddr{
++			Addr: addr.Unmap(),
++			Port: uint16(request.DstAddr.Port),
++		}
++	}
++
++	// Get username from connection.
++	if userCtx, ok := conn.(mierucommon.UserContext); ok {
++		metadata.User = userCtx.UserName()
++	}
++
++	// Handle request.
++	switch request.Command {
++	case mieruconstant.Socks5ConnectCmd:
++		h.logger.InfoContext(ctx, "inbound TCP connection from ", metadata.Source, " to ", metadata.Destination)
++		if metadata.User != "" {
++			h.logger.InfoContext(ctx, "[", metadata.User, "] inbound TCP connection")
++		}
++		h.router.RouteConnectionEx(ctx, conn, metadata, nil)
++	case mieruconstant.Socks5UDPAssociateCmd:
++		h.logger.InfoContext(ctx, "inbound UDP connection from ", metadata.Source, " to ", metadata.Destination)
++		if metadata.User != "" {
++			h.logger.InfoContext(ctx, "[", metadata.User, "] inbound UDP connection")
++		}
++		h.handleUDP(ctx, conn, metadata)
++	default:
++		conn.Close()
++		h.logger.WarnContext(ctx, "unsupported mieru command: ", request.Command)
++	}
++}
++
++func (h *Inbound) handleUDP(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) {
++	pc := mierucommon.NewPacketOverStreamTunnel(conn)
++	packetConn := &mieruPacketConn{
++		PacketConn:  pc,
++		destination: metadata.Destination,
++	}
++	h.router.RoutePacketConnectionEx(ctx, packetConn, metadata, nil)
++}
++
++// mieruPacketConn wraps mieru's PacketConn to implement N.PacketConn
++type mieruPacketConn struct {
++	net.PacketConn
++	destination M.Socksaddr
++}
++
++var _ N.PacketConn = (*mieruPacketConn)(nil)
++
++// ReadPacket parses the SOCKS5 UDP header and returns the destination address.
++func (c *mieruPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
++	n, _, err := c.PacketConn.ReadFrom(buffer.FreeBytes())
++	if err != nil {
++		return M.Socksaddr{}, err
++	}
++	buffer.Truncate(n)
++	if buffer.Len() < 3 {
++		return M.Socksaddr{}, io.ErrShortBuffer
++	}
++
++	// Skip RSV (2 bytes) and FRAG (1 byte).
++	buffer.Advance(3)
++
++	var addr mierumodel.AddrSpec
++	if err := addr.ReadFromSocks5(buffer); err != nil {
++		return M.Socksaddr{}, err
++	}
++	if addr.FQDN != "" {
++		destination = M.Socksaddr{
++			Fqdn: addr.FQDN,
++			Port: uint16(addr.Port),
++		}
++	} else if addr.IP != nil {
++		netAddr, _ := netip.AddrFromSlice(addr.IP)
++		destination = M.Socksaddr{
++			Addr: netAddr.Unmap(),
++			Port: uint16(addr.Port),
++		}
++	}
++	return destination, nil
++}
++
++// WritePacket writes the SOCKS5 UDP header and the payload.
++func (c *mieruPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
++	header := buf.NewSize(3 + M.MaxSocksaddrLength)
++	defer header.Release()
++
++	// RSV (2 bytes) + FRAG (1 byte)
++	common.Must(header.WriteZeroN(3))
++
++	var addr mierumodel.AddrSpec
++	if destination.IsFqdn() {
++		addr.FQDN = destination.Fqdn
++	} else {
++		addr.IP = destination.Addr.AsSlice()
++	}
++	addr.Port = int(destination.Port)
++	if err := addr.WriteToSocks5(header); err != nil {
++		return err
++	}
++
++	packet := buf.NewSize(header.Len() + buffer.Len())
++	defer packet.Release()
++	common.Must1(packet.Write(header.Bytes()))
++	common.Must1(packet.Write(buffer.Bytes()))
++	_, err := c.PacketConn.WriteTo(packet.Bytes(), nil)
++	return err
++}
++
++func buildMieruServerConfig(_ context.Context, options option.MieruInboundOptions) (*mieruserver.ServerConfig, []string, error) {
++	if err := validateMieruInboundOptions(options); err != nil {
++		return nil, nil, fmt.Errorf("failed to validate mieru options: %w", err)
++	}
++
++	var transportProtocol *mierupb.TransportProtocol
++	switch options.Transport {
++	case "TCP":
++		transportProtocol = mierupb.TransportProtocol_TCP.Enum()
++	case "UDP":
++		transportProtocol = mierupb.TransportProtocol_UDP.Enum()
++	}
++
++	if options.ListenOptions.ListenPort == 0 {
++		return nil, nil, E.New("listen_port must be set")
++	}
++	portBindings := []*mierupb.PortBinding{
++		{
++			Port:     proto.Int32(int32(options.ListenOptions.ListenPort)),
++			Protocol: transportProtocol,
++		},
++	}
++
++	var users []*mierupb.User
++	var userNames []string
++	for _, user := range options.Users {
++		users = append(users, &mierupb.User{
++			Name:     proto.String(user.Name),
++			Password: proto.String(user.Password),
++		})
++		userNames = append(userNames, user.Name)
++	}
++	var trafficPattern *mierupb.TrafficPattern
++	trafficPattern, _ = mierutp.Decode(options.TrafficPattern)
++	return &mieruserver.ServerConfig{
++		Config: &mierupb.ServerConfig{
++			PortBindings:   portBindings,
++			Users:          users,
++			TrafficPattern: trafficPattern,
++		},
++	}, userNames, nil
++}
++
++func validateMieruInboundOptions(options option.MieruInboundOptions) error {
++	if options.Transport != "TCP" && options.Transport != "UDP" {
++		return E.New("transport must be TCP or UDP")
++	}
++	if len(options.Users) == 0 {
++		return E.New("users is empty")
++	}
++	for _, user := range options.Users {
++		if user.Name == "" {
++			return E.New("username is empty")
++		}
++		if user.Password == "" {
++			return E.New("password is empty")
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, err := mierutp.Decode(options.TrafficPattern)
++		if err != nil {
++			return fmt.Errorf("failed to decode traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++		if err := mierutp.Validate(trafficPattern); err != nil {
++			return fmt.Errorf("invalid traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++	}
++	return nil
++}
+diff --git a/protocol/mieru/outbound.go b/protocol/mieru/outbound.go
+new file mode 100644
+index 0000000..d04826f
+--- /dev/null
++++ b/protocol/mieru/outbound.go
+@@ -0,0 +1,277 @@
++package mieru
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"os"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mieruclient "github.com/enfein/mieru/v3/apis/client"
++	mierucommon "github.com/enfein/mieru/v3/apis/common"
++	mierumodel "github.com/enfein/mieru/v3/apis/model"
++	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
++	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
++	"google.golang.org/protobuf/proto"
++)
++
++type Outbound struct {
++	outbound.Adapter
++	dialer N.Dialer
++	logger log.ContextLogger
++	client mieruclient.Client
++}
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register(registry, C.TypeMieru, NewOutbound)
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MieruOutboundOptions) (adapter.Outbound, error) {
++	outboundDialer, err := dialer.New(ctx, options.DialerOptions, M.IsDomainName(options.Server))
++	if err != nil {
++		return nil, err
++	}
++
++	config, err := buildMieruClientConfig(options, mieruDialer{dialer: outboundDialer})
++	if err != nil {
++		return nil, fmt.Errorf("failed to build mieru client config: %w", err)
++	}
++	c := mieruclient.NewClient()
++	if err := c.Store(config); err != nil {
++		return nil, fmt.Errorf("failed to store mieru client config: %w", err)
++	}
++	if err := c.Start(); err != nil {
++		return nil, fmt.Errorf("failed to start mieru client: %w", err)
++	}
++	logger.InfoContext(ctx, "mieru client is started")
++
++	return &Outbound{
++		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeMieru, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
++		dialer:  outboundDialer,
++		logger:  logger,
++		client:  c,
++	}, nil
++}
++
++func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound = o.Tag()
++	metadata.Destination = destination
++	switch N.NetworkName(network) {
++	case N.NetworkTCP:
++		o.logger.InfoContext(ctx, "outbound connection to ", destination)
++		d, err := socksAddrToNetAddrSpec(destination, "tcp")
++		if err != nil {
++			return nil, E.Cause(err, "failed to convert destination address")
++		}
++		return o.client.DialContext(ctx, d)
++	case N.NetworkUDP:
++		o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
++		d, err := socksAddrToNetAddrSpec(destination, "udp")
++		if err != nil {
++			return nil, E.Cause(err, "failed to convert destination address")
++		}
++		streamConn, err := o.client.DialContext(ctx, d)
++		if err != nil {
++			return nil, err
++		}
++		return &streamer{
++			PacketConn: mierucommon.NewUDPAssociateWrapper(mierucommon.NewPacketOverStreamTunnel(streamConn)),
++			Remote:     destination,
++		}, nil
++	default:
++		return nil, os.ErrInvalid
++	}
++}
++
++func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound = o.Tag()
++	metadata.Destination = destination
++	o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
++	d, err := socksAddrToNetAddrSpec(destination, "udp")
++	if err != nil {
++		return nil, E.Cause(err, "failed to convert destination address")
++	}
++	streamConn, err := o.client.DialContext(ctx, d)
++	if err != nil {
++		return nil, err
++	}
++	return mierucommon.NewUDPAssociateWrapper(mierucommon.NewPacketOverStreamTunnel(streamConn)), nil
++}
++
++func (o *Outbound) Close() error {
++	return common.Close(o.client)
++}
++
++// mieruDialer is an adapter to mieru dialer interface.
++type mieruDialer struct {
++	dialer N.Dialer
++}
++
++func (md mieruDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	addr := M.ParseSocksaddr(address)
++	return md.dialer.DialContext(ctx, network, addr)
++}
++
++func (md mieruDialer) ListenPacket(ctx context.Context, network, laddr, raddr string) (net.PacketConn, error) {
++	addr := M.ParseSocksaddr(raddr)
++	return md.dialer.ListenPacket(ctx, addr)
++}
++
++var (
++	_ mierucommon.Dialer       = (*mieruDialer)(nil)
++	_ mierucommon.PacketDialer = (*mieruDialer)(nil)
++)
++
++// streamer converts a net.PacketConn to a net.Conn.
++type streamer struct {
++	net.PacketConn
++	Remote net.Addr
++}
++
++var _ net.Conn = (*streamer)(nil)
++
++func (s *streamer) Read(b []byte) (n int, err error) {
++	n, _, err = s.PacketConn.ReadFrom(b)
++	return
++}
++
++func (s *streamer) Write(b []byte) (n int, err error) {
++	return s.WriteTo(b, s.Remote)
++}
++
++func (s *streamer) RemoteAddr() net.Addr {
++	return s.Remote
++}
++
++// socksAddrToNetAddrSpec converts a Socksaddr object to NetAddrSpec, and overrides the network.
++func socksAddrToNetAddrSpec(sa M.Socksaddr, network string) (mierumodel.NetAddrSpec, error) {
++	var nas mierumodel.NetAddrSpec
++	if err := nas.From(sa); err != nil {
++		return nas, err
++	}
++	nas.Net = network
++	return nas, nil
++}
++
++func buildMieruClientConfig(options option.MieruOutboundOptions, dialer mieruDialer) (*mieruclient.ClientConfig, error) {
++	if err := validateMieruOptions(options); err != nil {
++		return nil, fmt.Errorf("failed to validate mieru options: %w", err)
++	}
++
++	var transportProtocol *mierupb.TransportProtocol
++	switch options.Transport {
++	case "TCP":
++		transportProtocol = mierupb.TransportProtocol_TCP.Enum()
++	case "UDP":
++		transportProtocol = mierupb.TransportProtocol_UDP.Enum()
++	}
++	server := &mierupb.ServerEndpoint{}
++	if options.ServerPort != 0 {
++		server.PortBindings = append(server.PortBindings, &mierupb.PortBinding{
++			Port:     proto.Int32(int32(options.ServerPort)),
++			Protocol: transportProtocol,
++		})
++	}
++	for _, pr := range options.ServerPortRanges {
++		server.PortBindings = append(server.PortBindings, &mierupb.PortBinding{
++			PortRange: proto.String(pr),
++			Protocol:  transportProtocol,
++		})
++	}
++	if M.IsDomainName(options.Server) {
++		server.DomainName = proto.String(options.Server)
++	} else {
++		server.IpAddress = proto.String(options.Server)
++	}
++	config := &mieruclient.ClientConfig{
++		Profile: &mierupb.ClientProfile{
++			ProfileName: proto.String("sing-box"),
++			User: &mierupb.User{
++				Name:     proto.String(options.UserName),
++				Password: proto.String(options.Password),
++			},
++			Servers: []*mierupb.ServerEndpoint{server},
++		},
++		Dialer:       dialer,
++		PacketDialer: dialer,
++		DNSConfig: &mierucommon.ClientDNSConfig{
++			BypassDialerDNS: true,
++		},
++	}
++	if multiplexing, ok := mierupb.MultiplexingLevel_value[options.Multiplexing]; ok {
++		config.Profile.Multiplexing = &mierupb.MultiplexingConfig{
++			Level: mierupb.MultiplexingLevel(multiplexing).Enum(),
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, _ := mierutp.Decode(options.TrafficPattern)
++		config.Profile.TrafficPattern = trafficPattern
++	}
++	return config, nil
++}
++
++func validateMieruOptions(options option.MieruOutboundOptions) error {
++	if options.Server == "" {
++		return fmt.Errorf("server is empty")
++	}
++	if options.ServerPort == 0 && len(options.ServerPortRanges) == 0 {
++		return fmt.Errorf("either server_port or server_ports must be set")
++	}
++	for _, pr := range options.ServerPortRanges {
++		begin, end, err := beginAndEndPortFromPortRange(pr)
++		if err != nil {
++			return fmt.Errorf("invalid server_ports format")
++		}
++		if begin < 1 || begin > 65535 {
++			return fmt.Errorf("begin port must be between 1 and 65535")
++		}
++		if end < 1 || end > 65535 {
++			return fmt.Errorf("end port must be between 1 and 65535")
++		}
++		if begin > end {
++			return fmt.Errorf("begin port must be less than or equal to end port")
++		}
++	}
++	if options.Transport != "TCP" && options.Transport != "UDP" {
++		return fmt.Errorf("transport must be TCP or UDP")
++	}
++	if options.UserName == "" {
++		return fmt.Errorf("username is empty")
++	}
++	if options.Password == "" {
++		return fmt.Errorf("password is empty")
++	}
++	if options.Multiplexing != "" {
++		if _, ok := mierupb.MultiplexingLevel_value[options.Multiplexing]; !ok {
++			return fmt.Errorf("invalid multiplexing level: %s", options.Multiplexing)
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, err := mierutp.Decode(options.TrafficPattern)
++		if err != nil {
++			return fmt.Errorf("failed to decode traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++		if err := mierutp.Validate(trafficPattern); err != nil {
++			return fmt.Errorf("invalid traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++	}
++	return nil
++}
++
++func beginAndEndPortFromPortRange(portRange string) (int, int, error) {
++	var begin, end int
++	_, err := fmt.Sscanf(portRange, "%d-%d", &begin, &end)
++	return begin, end, err
++}
+diff --git a/protocol/naive/user.go b/protocol/naive/user.go
+new file mode 100644
+index 0000000..fd74140
+--- /dev/null
++++ b/protocol/naive/user.go
+@@ -0,0 +1,10 @@
++package naive
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (n *Inbound) UpdateUsers(users []auth.User) error {
++	n.authenticator = auth.NewAuthenticator(users)
++	return nil
++}
+diff --git a/protocol/shadowsocks/user.go b/protocol/shadowsocks/user.go
+new file mode 100644
+index 0000000..0480f58
+--- /dev/null
++++ b/protocol/shadowsocks/user.go
+@@ -0,0 +1,15 @@
++package shadowsocks
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *MultiInbound) UpdateUsersByOptions(users []option.ShadowsocksUser) error {
++	h.users = users
++	return h.service.UpdateUsersWithPasswords(common.MapIndexed(h.users, func(index int, user option.ShadowsocksUser) int {
++		return index
++	}), common.Map(h.users, func(user option.ShadowsocksUser) string {
++		return user.Password
++	}))
++}
+diff --git a/protocol/socks/user.go b/protocol/socks/user.go
+new file mode 100644
+index 0000000..f39d98f
+--- /dev/null
++++ b/protocol/socks/user.go
+@@ -0,0 +1,10 @@
++package socks
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (h *Inbound) UpdateUsers(users []auth.User) error {
++	h.authenticator = auth.NewAuthenticator(users)
++	return nil
++}
+diff --git a/protocol/trojan/user.go b/protocol/trojan/user.go
+new file mode 100644
+index 0000000..cc75e06
+--- /dev/null
++++ b/protocol/trojan/user.go
+@@ -0,0 +1,15 @@
++package trojan
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *Inbound) UpdateUsers(users []option.TrojanUser) error {
++	h.users = users
++	return h.service.UpdateUsers(common.MapIndexed(h.users, func(index int, it option.TrojanUser) int {
++		return index
++	}), common.Map(h.users, func(it option.TrojanUser) string {
++		return it.Password
++	}))
++}
+diff --git a/protocol/tuic/user.go b/protocol/tuic/user.go
+new file mode 100644
+index 0000000..f77755c
+--- /dev/null
++++ b/protocol/tuic/user.go
+@@ -0,0 +1,30 @@
++package tuic
++
++import (
++	"github.com/gofrs/uuid/v5"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/exceptions"
++)
++
++func (h *Inbound) UpdateUsers(users []option.TUICUser) error {
++	var userList []int
++	var userNameList []string
++	var userUUIDList [][16]byte
++	var userPasswordList []string
++	for index, user := range users {
++		if user.UUID == "" {
++			return exceptions.New("missing uuid for user ", index)
++		}
++		userUUID, err := uuid.FromString(user.UUID)
++		if err != nil {
++			return exceptions.Cause(err, "invalid uuid for user ", index)
++		}
++		userList = append(userList, index)
++		userNameList = append(userNameList, user.Name)
++		userUUIDList = append(userUUIDList, userUUID)
++		userPasswordList = append(userPasswordList, user.Password)
++	}
++	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
++	h.userNameList = userNameList
++	return nil
++}
+diff --git a/protocol/vless/user.go b/protocol/vless/user.go
+new file mode 100644
+index 0000000..583d1ef
+--- /dev/null
++++ b/protocol/vless/user.go
+@@ -0,0 +1,18 @@
++package vless
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *Inbound) UpdateUsers(users []option.VLESSUser) error {
++	h.users = users
++	h.service.UpdateUsers(common.MapIndexed(h.users, func(index int, _ option.VLESSUser) int {
++		return index
++	}), common.Map(h.users, func(it option.VLESSUser) string {
++		return it.UUID
++	}), common.Map(h.users, func(it option.VLESSUser) string {
++		return it.Flow
++	}))
++	return nil
++}
+diff --git a/protocol/vmess/user.go b/protocol/vmess/user.go
+new file mode 100644
+index 0000000..3dd74e4
+--- /dev/null
++++ b/protocol/vmess/user.go
+@@ -0,0 +1,42 @@
++package vmess
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *Inbound) UpdateUsers(users []option.VMessUser) error {
++	h.users = users
++	return h.service.UpdateUsers(common.MapIndexed(h.users, func(index int, it option.VMessUser) int {
++		return index
++	}), common.Map(h.users, func(it option.VMessUser) string {
++		return it.UUID
++	}), common.Map(h.users, func(it option.VMessUser) int {
++		return it.AlterId
++	}))
++}
++
++func (h *Inbound) DelUsers(uuids []string) error {
++	toDelete := make(map[string]struct{})
++	for _, uuid := range uuids {
++		toDelete[uuid] = struct{}{}
++	}
++	remaining := make([]option.VMessUser, 0)
++	for _, user := range h.users {
++		if _, found := toDelete[user.UUID]; !found {
++			remaining = append(remaining, user)
++		}
++	}
++	h.users = remaining
++	err := h.service.UpdateUsers(
++		common.MapIndexed(h.users, func(index int, it option.VMessUser) int {
++			return index
++		}),
++		common.Map(h.users, func(it option.VMessUser) string {
++			return it.UUID
++		}),
++		common.Map(h.users, func(it option.VMessUser) int {
++			return it.AlterId
++		}))
++	return err
++}
+diff --git a/route/route.go b/route/route.go
+index bf25bae..21632e0 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -345,6 +345,8 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ }
+ 
+ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
++	r.rulesAccess.RLock()
++	defer r.rulesAccess.RUnlock()
+ 	ctx := log.ContextWithNewID(r.ctx)
+ 	metadata.PreMatch = true
+ 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
+@@ -624,6 +626,8 @@ func (r *Router) matchRule(
+ 	selectedRule adapter.Rule, selectedRuleIndex int,
+ 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
+ ) {
++	r.rulesAccess.RLock()
++	defer r.rulesAccess.RUnlock()
+ 	fatalErr = r.prepareMatchMetadata(ctx, metadata)
+ 	if fatalErr != nil {
+ 		return
+diff --git a/route/router.go b/route/router.go
+index 0673dde..3221b60 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"os"
+ 	"runtime"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -25,6 +26,9 @@ import (
+ var _ adapter.Router = (*Router)(nil)
+ 
+ type Router struct {
++	rulesAccess       sync.RWMutex
++	ruleSetAccess     sync.RWMutex
++	started           bool
+ 	ctx               context.Context
+ 	logger            log.ContextLogger
+ 	inbound           adapter.InboundManager
+@@ -102,9 +106,7 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
+ 	switch stage {
+ 	case adapter.StartStateInitialize:
+-		for _, ruleSet := range r.ruleSets {
+-			scope.Add(ruleSet.Close)
+-		}
++		scope.Add(r.closeRuleSets)
+ 		if r.needFindNeighbor {
+ 			if r.platformInterface != nil && r.platformInterface.UsePlatformNeighborResolver() {
+ 				monitor.Start("initialize neighbor resolver")
+@@ -165,7 +167,12 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 		}
+ 		r.ruleSetUpdater = R.NewRuleSetUpdater(r.ctx, r.ruleSets)
+ 		if r.ruleSetUpdater != nil {
+-			scope.Add(r.ruleSetUpdater.Close)
++			scope.Add(func() error {
++				if r.ruleSetUpdater != nil {
++					return r.ruleSetUpdater.Close()
++				}
++				return nil
++			})
+ 		}
+ 		r.network.Initialize(r.ruleSets)
+ 		needFindProcess := r.needFindProcess
+@@ -205,8 +212,8 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 			r.processCache = processCache
+ 		}
+ 	case adapter.StartStatePostStart:
++		scope.Add(r.closeRules)
+ 		for i, rule := range r.rules {
+-			scope.Add(rule.Close)
+ 			monitor.Start("initialize rule[", i, "]")
+ 			err := rule.Start()
+ 			monitor.Finish()
+@@ -219,6 +226,7 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 		}
+ 		return nil
+ 	case adapter.StartStateStarted:
++		r.started = true
+ 		for _, ruleSet := range r.ruleSets {
+ 			ruleSet.Cleanup()
+ 		}
+@@ -228,12 +236,16 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ }
+ 
+ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
++	r.ruleSetAccess.RLock()
++	defer r.ruleSetAccess.RUnlock()
+ 	ruleSet, loaded := r.ruleSetMap[tag]
+ 	return ruleSet, loaded
+ }
+ 
+ func (r *Router) Rules() []adapter.Rule {
+-	return r.rules
++	r.rulesAccess.RLock()
++	defer r.rulesAccess.RUnlock()
++	return append([]adapter.Rule(nil), r.rules...)
+ }
+ 
+ func (r *Router) AppendTracker(tracker adapter.ConnectionTracker) {
+@@ -244,6 +256,138 @@ func (r *Router) NeedFindProcess() bool {
+ 	return r.needFindProcess
+ }
+ 
++func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) error {
++	r.rulesAccess.Lock()
++	defer r.rulesAccess.Unlock()
++	newRules := make([]adapter.Rule, 0, len(rules))
++	for i, options := range rules {
++		if err := R.ValidateNoNestedRuleActions(options); err != nil {
++			return err
++		}
++		rule, err := R.NewRule(r.ctx, r.logger, options, false)
++		if err != nil {
++			return E.Cause(err, "parse rule[", i, "]")
++		}
++		newRules = append(newRules, rule)
++	}
++
++	newRuleSets := make([]adapter.RuleSet, 0, len(ruleSets))
++	newRuleSetMap := make(map[string]adapter.RuleSet)
++	committed := false
++	defer func() {
++		if !committed {
++			for _, rule := range newRules {
++				_ = rule.Close()
++			}
++			for _, ruleSet := range newRuleSets {
++				_ = ruleSet.Close()
++			}
++		}
++	}()
++	for i, options := range ruleSets {
++		for _, tag := range options.Tag {
++			if _, exists := newRuleSetMap[tag]; exists {
++				return E.New("duplicate rule-set tag: ", tag)
++			}
++			ruleSet, err := R.NewRuleSet(r.ctx, r.logger, tag, options)
++			if err != nil {
++				return E.Cause(err, "parse rule-set[", i, "]")
++			}
++			newRuleSets = append(newRuleSets, ruleSet)
++			newRuleSetMap[tag] = ruleSet
++		}
++	}
++
++	if r.started {
++		var cacheContext *adapter.HTTPStartContext
++		if len(newRuleSets) > 0 {
++			cacheContext = adapter.NewHTTPStartContext()
++			defer cacheContext.Close()
++			var ruleSetStartGroup task.Group
++			for i, ruleSet := range newRuleSets {
++				ruleSetInPlace := ruleSet
++				ruleSetStartGroup.Append0(func(ctx context.Context) error {
++					err := ruleSetInPlace.StartContext(ctx, cacheContext)
++					if err != nil {
++						return E.Cause(err, "initialize rule-set[", i, "]")
++					}
++					return nil
++				})
++			}
++			ruleSetStartGroup.Concurrency(5)
++			ruleSetStartGroup.FastFail()
++			err := ruleSetStartGroup.Run(r.ctx)
++			if err != nil {
++				return err
++			}
++		}
++		r.ruleSetAccess.Lock()
++		oldMap := r.ruleSetMap
++		r.ruleSetMap = newRuleSetMap
++		r.ruleSetAccess.Unlock()
++		defer func() {
++			if !committed {
++				r.ruleSetAccess.Lock()
++				r.ruleSetMap = oldMap
++				r.ruleSetAccess.Unlock()
++			}
++		}()
++		for i, rule := range newRules {
++			err := rule.Start()
++			if err != nil {
++				return E.Cause(err, "initialize rule[", i, "]")
++			}
++		}
++		oldRules := r.rules
++		oldRuleSets := r.ruleSets
++
++		r.rules = newRules
++		r.ruleSets = newRuleSets
++		if r.ruleSetUpdater != nil {
++			_ = r.ruleSetUpdater.Close()
++		}
++		r.ruleSetUpdater = R.NewRuleSetUpdater(r.ctx, newRuleSets)
++		if r.ruleSetUpdater != nil {
++			r.ruleSetUpdater.Start()
++		}
++
++		r.network.Initialize(r.ruleSets)
++
++		for _, rule := range oldRules {
++			rule.Close()
++		}
++		for _, ruleSet := range oldRuleSets {
++			ruleSet.Close()
++		}
++	} else {
++		r.rules = newRules
++		r.ruleSets = newRuleSets
++		r.ruleSetAccess.Lock()
++		r.ruleSetMap = newRuleSetMap
++		r.ruleSetAccess.Unlock()
++	}
++	committed = true
++	return nil
++}
++
++func (r *Router) closeRules() error {
++	r.rulesAccess.Lock()
++	defer r.rulesAccess.Unlock()
++	for _, rule := range r.rules {
++		_ = rule.Close()
++	}
++	return nil
++}
++
++func (r *Router) closeRuleSets() error {
++	r.rulesAccess.Lock()
++	defer r.rulesAccess.Unlock()
++	for _, ruleSet := range r.ruleSets {
++		_ = ruleSet.Close()
++	}
++	return nil
++}
++
+ func (r *Router) NeedFindNeighbor() bool {
+ 	return r.needFindNeighbor
+ }

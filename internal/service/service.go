@@ -26,6 +26,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/tracker"
+	"github.com/google/uuid"
 )
 
 type Service struct {
@@ -61,7 +62,10 @@ type Service struct {
 
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive atomic.Bool
-	pullActive atomic.Bool
+	pushWG     sync.WaitGroup
+	// Accessed only by the single report sender, including the final flush.
+	pendingTrafficBatch trafficBatch
+	pullActive          atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -975,29 +979,53 @@ func (s *Service) pushReportAsync() {
 		return
 	}
 
-	traffic := s.tracker.FlushTraffic()
+	s.pushWG.Add(1)
+	go func() {
+		defer s.pushWG.Done()
+		defer s.pushActive.Store(false)
+		if err := s.sendReport(); err != nil {
+			nlog.Core().Warn("failed to push report", "error", err)
+			s.pushBackoff.onFailure()
+			return
+		}
+		s.pushBackoff.onSuccess()
+	}()
+}
+
+type trafficBatch struct {
+	id      string
+	traffic map[int][2]int64
+}
+
+func (s *Service) sendReport() error {
+	dedup, supportsDedup := s.sink.(interface{ SupportsTrafficBatchDedup() bool })
+	useBatch := s.pendingTrafficBatch.id != "" || (supportsDedup && dedup.SupportsTrafficBatchDedup())
+	batch := s.pendingTrafficBatch
+	if batch.id == "" {
+		batch.traffic = s.tracker.FlushTraffic()
+		if useBatch && len(batch.traffic) != 0 {
+			batch.id = uuid.NewString()
+			s.pendingTrafficBatch = batch
+		}
+	}
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
-	go func() {
-		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-			nlog.Core().Warn("failed to push report", "error", err)
-			if len(traffic) > 0 {
-				s.tracker.RestoreTraffic(traffic)
-			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
-			}
-			s.pushBackoff.onFailure()
-			return
+	if err := s.sink.Report(controlplane.ReportPayload{TrafficBatchID: batch.id, Traffic: batch.traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if batch.id == "" && len(batch.traffic) > 0 {
+			s.tracker.RestoreTraffic(batch.traffic)
 		}
-		s.pushBackoff.onSuccess()
-		nlog.ReportPushed(len(traffic), len(online))
-	}()
+		if len(aliveIPs) > 0 {
+			s.tracker.RestoreAliveIPs(aliveIPs)
+		}
+		return err
+	}
+	s.pendingTrafficBatch = trafficBatch{}
+	nlog.ReportPushed(len(batch.traffic), len(online))
+	return nil
 }
 
 // pushReportSync is used only during shutdown to ensure final data is sent.
@@ -1005,15 +1033,16 @@ func (s *Service) pushReportSync() {
 	if !s.sink.SupportsReporting() {
 		return
 	}
-	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
-	status := monitor.Collect()
-	metrics := s.buildMetrics(status)
-	metrics["kernel_status"] = s.kernel.IsRunning()
-
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+	s.pushWG.Wait()
+	hadPending := s.pendingTrafficBatch.id != ""
+	if err := s.sendReport(); err != nil {
 		nlog.Core().Warn("failed to push final report", "error", err)
+		return
+	}
+	if hadPending {
+		if err := s.sendReport(); err != nil {
+			nlog.Core().Warn("failed to push final report", "error", err)
+		}
 	}
 }
 
@@ -1170,7 +1199,7 @@ func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model
 func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelType string) error {
 	needsCert := false
 	switch spec.Protocol {
-	case "hysteria", "hysteria2", "tuic", "anytls":
+	case "hysteria", "hysteria2", "tuic", "anytls", "nw3":
 		needsCert = true
 	case "trojan":
 		if spec.TLS != 2 {

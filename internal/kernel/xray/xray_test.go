@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync/atomic"
@@ -12,8 +13,28 @@ import (
 	xrayCore "github.com/xtls/xray-core/core"
 	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	xraystats "github.com/xtls/xray-core/features/stats"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"golang.org/x/time/rate"
 )
+
+func TestSS2022HotUpdateUsesInitialConfigKey(t *testing.T) {
+	user := model.UserSpec{ID: 1, UUID: "11111111-1111-1111-1111-111111111111"}
+	for method, spec := range ss2022Methods {
+		t.Run(method, func(t *testing.T) {
+			node := &model.NodeSpec{Protocol: "shadowsocks", Cipher: method}
+			memoryUser, err := toMemoryUser("shadowsocks", node, user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := make([]byte, spec.size)
+			copy(expected, user.UUID)
+			account, ok := memoryUser.Account.(*ss2022.MemoryAccount)
+			if !ok || !bytes.Equal(account.Key, expected) {
+				t.Fatalf("hot-update key does not match initial %s configuration", method)
+			}
+		})
+	}
+}
 
 func newStatsManager(t *testing.T) xraystats.Manager {
 	t.Helper()
@@ -162,7 +183,6 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
@@ -173,7 +193,6 @@ func TestXrayCapabilities(t *testing.T) {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -189,7 +208,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -213,7 +231,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -228,7 +245,6 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
-
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})

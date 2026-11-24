@@ -1,0 +1,520 @@
+diff --git a/internal/tunnel/mux_session.go b/internal/tunnel/mux_session.go
+index c01914b..b92b448 100644
+--- a/internal/tunnel/mux_session.go
++++ b/internal/tunnel/mux_session.go
+@@ -63,7 +63,9 @@ const (
+ var errMuxReceiveQueueFull = errors.New("mux receive queue full")
+ 
+ type muxSession struct {
+-	conn net.Conn
++	conn        net.Conn
++	queueLimit  int
++	streamLimit int
+ 
+ 	// writeMu is held by whichever goroutine is writing to conn. Small frames wait in pending
+ 	// (guarded by pendMu) so that one write can carry the frames of several streams.
+@@ -92,8 +94,14 @@ type muxSession struct {
+ }
+ 
+ func newMuxSession(conn net.Conn, onOpen func(stream *muxStream, payload []byte)) *muxSession {
++	return newMuxSessionWithLimits(conn, onOpen, 0, 0)
++}
++
++func newMuxSessionWithLimits(conn net.Conn, onOpen func(stream *muxStream, payload []byte), queueLimit, streamLimit int) *muxSession {
+ 	s := &muxSession{
+ 		conn:         conn,
++		queueLimit:   queueLimit,
++		streamLimit:  streamLimit,
+ 		streams:      make(map[uint32]*muxStream),
+ 		closed:       make(chan struct{}),
+ 		onOpen:       onOpen,
+@@ -444,6 +452,13 @@ func (s *muxSession) readLoop() {
+ 			s.lastPong.Store(time.Now().UnixNano())
+ 
+ 		case muxFrameOpen:
++			s.streamsMu.Lock()
++			full := s.streamLimit > 0 && len(s.streams) >= s.streamLimit
++			s.streamsMu.Unlock()
++			if full {
++				s.closeWithError(errors.New("mux stream limit reached"))
++				return
++			}
+ 			if s.onOpen == nil {
+ 				s.sendReset(streamID, "unexpected open")
+ 				continue
+diff --git a/internal/tunnel/mux_stream.go b/internal/tunnel/mux_stream.go
+index 5d21799..35d466a 100644
+--- a/internal/tunnel/mux_stream.go
++++ b/internal/tunnel/mux_stream.go
+@@ -274,7 +274,11 @@ func (c *muxStream) enqueue(chunk *muxChunk) error {
+ 		chunk.release()
+ 		return nil
+ 	}
+-	if c.queuedBytes+len(chunk.data) > muxMaxQueuedBytesPerStream {
++	limit := muxMaxQueuedBytesPerStream
++	if c.session != nil && c.session.queueLimit > 0 {
++		limit = c.session.queueLimit
++	}
++	if c.queuedBytes+len(chunk.data) > limit {
+ 		chunk.release()
+ 		return errMuxReceiveQueueFull
+ 	}
+diff --git a/apis/xboard.go b/apis/xboard.go
+new file mode 100644
+--- /dev/null
++++ b/apis/xboard.go
+@@ -0,0 +1,109 @@
++package apis
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++	"net"
++
++	"github.com/SUDOKU-ASCII/sudoku/internal/config"
++	"github.com/SUDOKU-ASCII/sudoku/internal/protocol"
++	"github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
++	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
++	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
++)
++
++// Credential contains immutable native handshake configuration. It owns no listener.
++type Credential struct {
++	cfg    *config.Config
++	tables []*sudoku.Table
++}
++
++func NewCredential(c Config, aead string) (*Credential, error) {
++	if aead != "aes-128-gcm" && aead != "chacha20-poly1305" {
++		return nil, fmt.Errorf("unsupported Sudoku AEAD")
++	}
++	normalized, err := Normalize(&c)
++	if err != nil {
++		return nil, err
++	}
++	tables, err := BuildTables(&normalized)
++	if err != nil {
++		return nil, err
++	}
++	cfg := &config.Config{Key: normalized.Key, ASCII: normalized.ASCII, AEAD: aead, PaddingMin: normalized.PaddingMin, PaddingMax: normalized.PaddingMax, EnablePureDownlink: normalized.EnablePureDownlink, HTTPMask: config.HTTPMaskConfig{Disable: true}}
++	return &Credential{cfg: cfg, tables: tables}, nil
++}
++
++type Acceptor struct {
++	byTable  map[*sudoku.Table]*config.Config
++	tables   []*sudoku.Table
++	byConfig map[*config.Config]*Credential
++}
++
++func NewAcceptor(credentials []*Credential) *Acceptor {
++	a := &Acceptor{byTable: make(map[*sudoku.Table]*config.Config), byConfig: make(map[*config.Config]*Credential)}
++	for _, c := range credentials {
++		for _, t := range c.tables {
++			a.byTable[t] = c.cfg
++			a.tables = append(a.tables, t)
++		}
++		a.byConfig[c.cfg] = c
++	}
++	return a
++}
++
++// Accept performs the official replay-protected handshake, without opening any target.
++func (a *Acceptor) Accept(raw net.Conn) (net.Conn, *Credential, string, error) {
++	conn, cfg, err := tunnel.SelectCredential(raw, a.byTable, a.tables)
++	if err != nil {
++		return nil, nil, "", err
++	}
++	credential := a.byConfig[cfg]
++	secure, meta, err := tunnel.ServerHandshake(conn, cfg, credential.tables)
++	if err != nil {
++		return nil, nil, "", err
++	}
++	return secure, credential, meta.UserHash, nil
++}
++
++func (c *Credential) Dialer(address string, privateKey []byte) *tunnel.StandardDialer {
++	cfg := *c.cfg
++	cfg.ServerAddress = address
++	return &tunnel.StandardDialer{BaseDialer: tunnel.BaseDialer{Config: &cfg, Tables: c.tables, PrivateKey: privateKey}}
++}
++
++const (
++	OpenTCP   = tunnel.KIPTypeOpenTCP
++	StartMux  = tunnel.KIPTypeStartMux
++	StartUoT  = tunnel.KIPTypeStartUoT
++	KeepAlive = tunnel.KIPTypeKeepAlive
++)
++
++type Message = tunnel.KIPMessage
++
++func HandleMuxStreams(conn net.Conn, handle func(net.Conn, string)) error {
++	return tunnel.HandleMuxStreams(conn, handle)
++}
++
++func ReadMessage(r io.Reader) (*Message, error) { return tunnel.ReadKIPMessage(r) }
++func WriteMessage(w io.Writer, kind byte, data []byte) error {
++	return tunnel.WriteKIPMessage(w, kind, data)
++}
++func DecodeTarget(data []byte) (string, error)         { return protocol.DecodeAddress(data) }
++func ReadDatagram(r io.Reader) (string, []byte, error) { return tunnel.ReadUoTDatagram(r) }
++
++// WriteDatagram is synchronous, so accounting cannot bill dropped queue entries.
++func WriteDatagram(w io.Writer, address string, payload []byte) error {
++	if len(payload) > 65507 {
++		return fmt.Errorf("UDP payload too large")
++	}
++	addr, err := protocol.AppendAddress(nil, address)
++	if err != nil {
++		return err
++	}
++	frame := binary.BigEndian.AppendUint16(nil, uint16(len(addr)))
++	frame = binary.BigEndian.AppendUint16(frame, uint16(len(payload)))
++	frame = append(frame, addr...)
++	return connutil.WriteFull(w, append(frame, payload...))
++}
+diff --git a/internal/tunnel/xboard.go b/internal/tunnel/xboard.go
+new file mode 100644
+--- /dev/null
++++ b/internal/tunnel/xboard.go
+@@ -0,0 +1,51 @@
++package tunnel
++
++import (
++	"bufio"
++	"fmt"
++	"io"
++	"net"
++
++	"github.com/SUDOKU-ASCII/sudoku/internal/config"
++	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
++)
++
++// SelectCredential reuses the native bounded probe for independently keyed users.
++func SelectCredential(raw net.Conn, configs map[*sudoku.Table]*config.Config, tables []*sudoku.Table) (net.Conn, *config.Config, error) {
++	selected, prefix, err := SelectHandshakeObfsByProbe(bufio.NewReader(raw), tables, func(p []byte, t *sudoku.Table, mode obfsUplinkMode) error {
++		if len(p) == 0 {
++			return io.EOF
++		}
++		return probeHandshakeBytes(p, configs[t], t, mode)
++	})
++	if err != nil {
++		return nil, nil, err
++	}
++	return NewPreBufferedConn(raw, prefix), configs[selected.Table], nil
++}
++
++// HandleMuxStreams hands decoded native streams to the embedding router, without
++// an intermediate dial/pipe that would hide application bytes from sniffing.
++func HandleMuxStreams(conn net.Conn, handle func(net.Conn, string)) error {
++	if conn == nil || handle == nil {
++		return fmt.Errorf("nil mux connection or handler")
++	}
++	session := newMuxSessionWithLimits(conn, func(stream *muxStream, payload []byte) {
++		target, err := decodeMuxOpenTarget(payload)
++		if err != nil {
++			stream.session.sendReset(stream.id, "bad address")
++			stream.abort(err)
++			stream.session.removeStream(stream.id)
++			return
++		}
++		defer stream.Close()
++		handle(stream, target)
++	}, 256*1024, 32)
++	session.startKeepalive(muxKeepaliveInterval, muxKeepaliveIdle)
++	<-session.closed
++	err := session.closedErr()
++	if isExpectedMuxSessionClose(err) {
++		return nil
++	}
++	return err
++}
+diff --git a/internal/tunnel/xboard_test.go b/internal/tunnel/xboard_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/tunnel/xboard_test.go
+@@ -0,0 +1,44 @@
++package tunnel
++
++import (
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestEmbeddedMuxQueueLimit(t *testing.T) {
++	stream := newMuxStream(&muxSession{queueLimit: 256 * 1024}, 1)
++	defer func() { stream.abort(io.EOF); _ = stream.Close() }()
++	if err := stream.enqueue(acquireMuxChunk(256 * 1024)); err != nil {
++		t.Fatal(err)
++	}
++	if err := stream.enqueue(acquireMuxChunk(1)); err != errMuxReceiveQueueFull {
++		t.Fatalf("queue cap not enforced: %v", err)
++	}
++}
++
++func TestEmbeddedMuxStreamLimit(t *testing.T) {
++	left, right := net.Pipe()
++	defer left.Close()
++	defer right.Close()
++	done := make(chan error, 1)
++	go func() {
++		done <- HandleMuxStreams(right, func(conn net.Conn, _ string) { var b [1]byte; _, _ = conn.Read(b[:]) })
++	}()
++	client, err := NewMuxClient(left)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	for i := 0; i < 33; i++ {
++		if _, err := client.Dial("example.com:443"); err != nil {
++			break
++		}
++	}
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("mux stream cap not enforced")
++	}
++}
+diff --git a/pkg/obfs/sudoku/table.go b/pkg/obfs/sudoku/table.go
+--- a/pkg/obfs/sudoku/table.go
++++ b/pkg/obfs/sudoku/table.go
+@@ -41,10 +41,8 @@
+ 	opposite *Table
+ 	hint     uint32
+ 
+-	// puzzles[puzzleStart[b]:puzzleStart[b+1]] are the puzzles of plaintext byte
+-	// b, each its four hint bytes in grid-cell order, first hint lowest.
+-	puzzleStart [257]uint32
+-	puzzles     []uint32
++	encode      *layoutPuzzles
++	encodeRanks [256]uint16
+ 
+ 	// hintSets[pos<<2|val] holds bit k when the k-th shuffled grid has val at
+ 	// pos. Four hints identify a plaintext byte exactly when their sets share a
+@@ -107,36 +105,20 @@
+ 	t := &Table{
+ 		IsASCII: layout.name == "ascii",
+ 		layout:  layout,
+-		puzzles: make([]uint32, 0, 24<<10),
++		encode:  sharedLayoutPuzzles(layout),
+ 	}
+ 
+ 	grids := shuffledGrids(key)
++	ranks := canonicalGridRanks()
+ 	for k, g := range grids {
++		if k < len(t.encodeRanks) {
++			t.encodeRanks[k] = ranks[g]
++		}
+ 		for pos, val := range g {
+ 			t.hintSets[pos<<2|int(val-1)][k>>6] |= 1 << (k & 63)
+ 		}
+ 	}
+ 
+-	for byteVal := 0; byteVal < 256; byteVal++ {
+-		t.puzzleStart[byteVal] = uint32(len(t.puzzles))
+-		g := &grids[byteVal]
+-		for _, positions := range hintPositions {
+-			var hints [4]uint8
+-			for i, pos := range positions {
+-				hints[i] = pos<<2 | (g[pos] - 1)
+-			}
+-			if got, ok := t.decodeHints(hints[0], hints[1], hints[2], hints[3]); !ok || got != byte(byteVal) {
+-				continue
+-			}
+-			var puzzle uint32
+-			for i, pos := range positions {
+-				puzzle |= uint32(layout.hintByte(g[pos]-1, pos)) << (8 * i)
+-			}
+-			t.puzzles = append(t.puzzles, puzzle)
+-		}
+-	}
+-	t.puzzleStart[256] = uint32(len(t.puzzles))
+-
+ 	logx.Infof("Init", "Sudoku Tables initialized (%s) in %v", layout.name, time.Since(start))
+ 	return t, nil
+ }
+diff --git a/pkg/obfs/sudoku/classic_encode.go b/pkg/obfs/sudoku/classic_encode.go
+--- a/pkg/obfs/sudoku/classic_encode.go
++++ b/pkg/obfs/sudoku/classic_encode.go
+@@ -48,9 +48,8 @@
+ // pickPuzzle draws one puzzle of plaintext byte b and one hint order from a
+ // single 64-bit random value.
+ func (t *Table) pickPuzzle(b byte, draw uint64) uint32 {
+-	first := t.puzzleStart[b]
+-	count := uint64(t.puzzleStart[int(b)+1] - first)
+-	puzzle := t.puzzles[first+uint32((draw>>32)*count>>32)]
++	puzzles := t.encode.byGrid[t.encodeRanks[b]]
++	puzzle := puzzles[(draw>>32)*uint64(len(puzzles))>>32]
+ 	return permute(puzzle, &permShifts[(draw&math.MaxUint32)*uint64(len(permShifts))>>32])
+ }
+ 
+diff --git a/pkg/obfs/sudoku/testing_helpers_test.go b/pkg/obfs/sudoku/testing_helpers_test.go
+--- a/pkg/obfs/sudoku/testing_helpers_test.go
++++ b/pkg/obfs/sudoku/testing_helpers_test.go
+@@ -98,7 +98,7 @@
+ 
+ // puzzlesOf returns the puzzles of plaintext byte b as four hint bytes each.
+ func puzzlesOf(tb *Table, b byte) [][4]byte {
+-	packed := tb.puzzles[tb.puzzleStart[b]:tb.puzzleStart[int(b)+1]]
++	packed := tb.encode.byGrid[tb.encodeRanks[b]]
+ 	out := make([][4]byte, len(packed))
+ 	for i, p := range packed {
+ 		out[i] = [4]byte{byte(p), byte(p >> 8), byte(p >> 16), byte(p >> 24)}
+diff --git a/pkg/obfs/sudoku/shared_puzzles.go b/pkg/obfs/sudoku/shared_puzzles.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/obfs/sudoku/shared_puzzles.go
+@@ -0,0 +1,75 @@
++package sudoku
++
++import "sync"
++
++var canonicalGridRanks = sync.OnceValue(func() map[grid]uint16 {
++	ranks := make(map[grid]uint16, len(allGrids()))
++	for i, g := range allGrids() {
++		ranks[g] = uint16(i)
++	}
++	return ranks
++})
++
++// A hint set is unique among all 288 grids regardless of the user's shuffle.
++// Preserve hintPositions order so that sampling chooses the same wire bytes.
++var canonicalPuzzles = sync.OnceValue(func() [][]uint32 {
++	grids := allGrids()
++	puzzles := make([][]uint32, len(grids))
++	signatures := make([]byte, len(grids))
++	for _, pos := range hintPositions {
++		var seen [256]uint16
++		for i, g := range grids {
++			sig := g[pos[0]] - 1 | (g[pos[1]]-1)<<2 | (g[pos[2]]-1)<<4 | (g[pos[3]]-1)<<6
++			signatures[i] = sig
++			seen[sig]++
++		}
++		for i, sig := range signatures {
++			if seen[sig] == 1 {
++				var hints uint32
++				for j, p := range pos {
++					hints |= uint32(p<<2|((sig>>(2*j))&3)) << (8 * j)
++				}
++				puzzles[i] = append(puzzles[i], hints)
++			}
++		}
++	}
++	return puzzles
++})
++
++type layoutPuzzles struct {
++	byGrid [][]uint32
++}
++
++var layoutPuzzleCache = struct {
++	sync.Mutex
++	sets map[[4][16]byte]*layoutPuzzles
++}{sets: make(map[[4][16]byte]*layoutPuzzles)}
++
++func sharedLayoutPuzzles(layout *byteLayout) *layoutPuzzles {
++	layoutPuzzleCache.Lock()
++	defer layoutPuzzleCache.Unlock()
++	if set := layoutPuzzleCache.sets[layout.encodeHint]; set != nil {
++		return set
++	}
++
++	canonical := canonicalPuzzles()
++	byGrid := make([][]uint32, len(canonical))
++	var wire [64]uint32
++	for i := range wire {
++		wire[i] = uint32(layout.hintByte(byte(i&3), byte(i>>2)))
++	}
++	for i, puzzles := range canonical {
++		packed := make([]uint32, len(puzzles))
++		for j, p := range puzzles {
++			packed[j] = wire[p&63] | wire[p>>8&63]<<8 | wire[p>>16&63]<<16 | wire[p>>24&63]<<24
++		}
++		byGrid[i] = packed
++	}
++	set := &layoutPuzzles{byGrid: byGrid}
++	// Active tables keep their references. Bound retained inactive custom layouts.
++	if len(layoutPuzzleCache.sets) >= 8 {
++		clear(layoutPuzzleCache.sets)
++	}
++	layoutPuzzleCache.sets[layout.encodeHint] = set
++	return set
++}
+diff --git a/pkg/obfs/sudoku/table_population_test.go b/pkg/obfs/sudoku/table_population_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/obfs/sudoku/table_population_test.go
+@@ -0,0 +1,70 @@
++package sudoku
++
++import (
++	"fmt"
++	"runtime"
++	"slices"
++	"testing"
++)
++
++func TestSharedEncodingMatchesPerKeyReference(t *testing.T) {
++	for _, tc := range []struct{ mode, custom string }{
++		{"prefer_ascii", ""},
++		{"prefer_entropy", ""},
++		{"up_ascii_down_entropy", "xpxvvpvv"},
++	} {
++		var previous *Table
++		for _, key := range []string{"first-key", "second-key"} {
++			table, err := NewTableWithCustom(key, tc.mode, tc.custom)
++			if err != nil {
++				t.Fatal(err)
++			}
++			opposite := table.OppositeDirection()
++			verifyClassicReference(t, table, key)
++			if opposite != table {
++				verifyClassicReference(t, opposite, key)
++			}
++			if previous != nil && (previous.encode != table.encode || previous.OppositeDirection().encode != opposite.encode) {
++				t.Fatal("keys using the same layout must share encoding tables")
++			}
++			previous = table
++		}
++	}
++}
++
++func verifyClassicReference(t *testing.T, table *Table, key string) {
++	t.Helper()
++	grids := shuffledGrids(key)
++	for b, g := range grids[:256] {
++		var ref []uint32
++		for _, pos := range hintPositions {
++			var encoded uint32
++			var hints [4]byte
++			for i, p := range pos {
++				hints[i] = p<<2 | (g[p] - 1)
++				encoded |= uint32(table.layout.hintByte(g[p]-1, p)) << (i * 8)
++			}
++			if got, ok := table.decodeHints(hints[0], hints[1], hints[2], hints[3]); ok && got == byte(b) {
++				ref = append(ref, encoded)
++			}
++		}
++		if len(ref) == 0 || !slices.Equal(ref, table.encode.byGrid[table.encodeRanks[b]]) {
++			t.Fatalf("key %s, layout %s, byte %d: different or empty puzzle sequence", key, table.layout.name, b)
++		}
++	}
++}
++
++func BenchmarkTablePopulation(b *testing.B) {
++	const users = 128
++	for range b.N {
++		tables := make([]*Table, users)
++		for i := range tables {
++			var err error
++			tables[i], err = NewTableWithCustom(fmt.Sprint(i), "prefer_entropy", "")
++			if err != nil {
++				b.Fatal(err)
++			}
++		}
++		runtime.KeepAlive(tables)
++	}
++}

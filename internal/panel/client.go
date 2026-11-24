@@ -39,8 +39,9 @@ type Client struct {
 	configETag string
 	userETag   string
 
-	apiSuccess atomic.Uint64
-	apiFailure atomic.Uint64
+	apiSuccess        atomic.Uint64
+	apiFailure        atomic.Uint64
+	trafficBatchDedup atomic.Bool
 }
 
 // NewClient creates a new panel API client.
@@ -99,7 +100,12 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
 		return nil, fmt.Errorf("decode handshake: %w", err)
 	}
+	c.trafficBatchDedup.Store(hs.TrafficBatchDedup)
 	return &hs, nil
+}
+
+func (c *Client) SupportsTrafficBatchDedup() bool {
+	return c.trafficBatchDedup.Load()
 }
 
 // Report sends consolidated traffic + alive + status data to the panel.
@@ -110,9 +116,18 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 	cpu float64, mem, swap, disk [2]uint64,
 	metrics map[string]interface{},
 ) error {
+	return c.ReportBatch("", traffic, alive, online, cpu, mem, swap, disk, metrics)
+}
+
+func (c *Client) ReportBatch(batchID string, traffic map[int][2]int64, alive map[int][]string, online map[int]int,
+	cpu float64, mem, swap, disk [2]uint64, metrics map[string]interface{},
+) error {
 	payload := make(map[string]interface{})
 
 	if len(traffic) > 0 {
+		if batchID != "" {
+			payload["traffic_batch_id"] = batchID
+		}
 		t := trafficMapPool.Get().(map[string][2]int64)
 		for uid, d := range traffic {
 			t[strconv.Itoa(uid)] = d

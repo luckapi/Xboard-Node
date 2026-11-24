@@ -12,6 +12,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/blocklist"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/kernel/singbox/nw3"
+	"github.com/cedar2025/xboard-node/internal/kernel/singbox/sudoku"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/go-viper/mapstructure/v2"
@@ -63,10 +65,9 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	customRouteRules := append([]model.CustomRouteRule{}, nc.CustomRouteRules...)
 	blockRules, err := blocklist.LoadRules(context.Background(), kcfg.BlockList)
 	if err != nil {
-		nlog.Core().Error("failed to load blocklist routes", "error", err)
-	} else {
-		customRouteRules = append(customRouteRules, blockRules...)
+		nlog.Core().Warn("blocklist source unavailable", "error", err)
 	}
+	customRouteRules = append(customRouteRules, blockRules...)
 
 	// Merge panel routes, node-side blocklist, and static config routes.
 	cfg["route"] = buildRoutes(nc.Routes, customRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
@@ -477,12 +478,41 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
-		"sniff":       true,
-		// Domain-based block rules need the sniffed Host/SNI to participate in routing.
-		"sniff_override_destination": true,
 	}
 
 	switch nc.Protocol {
+	case "sudoku":
+		base["type"] = sudoku.Type
+		base["network"] = nc.Network
+		for _, key := range []string{"aead", "ascii", "padding_min", "padding_max", "enable_pure_downlink", "custom_tables"} {
+			if value, ok := nc.NetworkSettings[key]; ok {
+				base[key] = value
+			}
+		}
+		list := make([]M, 0, len(users))
+		for _, user := range users {
+			list = append(list, M{"name": user.UUID, "uuid": user.UUID})
+		}
+		base["users"] = list
+		return base
+	case "nw3":
+		base["type"] = nw3.Type
+		base["tls"] = buildTLSConfig(nc, tc)
+		base["network"] = "both"
+		base["morph"] = true
+		if nc.Network != "" {
+			base["network"] = nc.Network
+		}
+		if value, ok := nc.NetworkSettings["morph"].(bool); ok {
+			base["morph"] = value
+		}
+		list := make([]M, 0, len(users))
+		for _, user := range users {
+			key, _ := nw3.SharedKey(user.UUID)
+			list = append(list, M{"name": user.UUID, "key": key})
+		}
+		base["users"] = list
+		return base
 	case "shadowsocks":
 		return buildShadowsocks(base, nc, users)
 	case "vmess":

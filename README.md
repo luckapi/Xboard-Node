@@ -6,7 +6,7 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-b
 
 ## Features
 
-- Protocols: V2Ray family, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS
+- Protocols: V2Ray family, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, Mieru, Sudoku, NW3
 - Sync: WebSocket push + REST polling dual channel
 - User controls: speed limit, device limit, alive-IP tracking, hot update
 - Deploy modes: node mode, machine mode, standalone mode
@@ -44,6 +44,40 @@ curl -fsSL https://raw.githubusercontent.com/luckapi/xboard-node/dev/install.sh 
 ```
 
 The installer uses systemd on Debian/Ubuntu/RHEL-family hosts and OpenRC on Alpine.
+
+## Build From Source
+
+Use Go 1.27.4 or newer and install `patch` (`apk add patch` on Alpine).
+
+```bash
+make deps
+make test
+make build-all
+```
+
+`make deps` downloads the official versions pinned in
+`scripts/kernel-versions.json`, verifies them through Go module checksums, and
+applies `scripts/kernel-patches/*.patch` into the ignored `third_party/`
+directory. Run it before using `go test`, `go build`, or `go mod tidy` directly.
+The build targets prepare these dependencies automatically.
+
+The current baselines are sing-box 1.14.4 and Xray 26.11.9 (commit
+`676eaf66f8f05d4d558ee7a74b4736623d3feeb9`), with Mieru 3.39.0 and AnyTLS
+0.0.13. The compatibility patches retain Mieru inbound support, user hot
+updates, routing reloads, and Xray per-user bandwidth limits. The downloaded
+kernels retain their upstream licenses.
+
+NW3 supports TLS 1.3, QUIC, Morph, multiple users, and per-user traffic
+accounting. See [NW3 configuration and compatibility](docs-nw3.md).
+
+Sudoku uses the official SUDOKU-ASCII 0.5.2-1 handshake, TCP, native stream
+multiplexing and UDP-over-TCP, with independent per-user credentials, live user
+updates and payload accounting. See [Sudoku configuration and limits](docs-sudoku.md).
+
+Traffic batches are only used if an authenticated panel advertises
+`traffic_batch_dedup` during its handshake. Otherwise the node retains the
+legacy report format and retry behavior. A node-only upgrade does not enable
+deduplication on an existing panel.
 
 ## xbctl
 

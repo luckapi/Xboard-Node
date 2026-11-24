@@ -82,10 +82,9 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	customRouteRules := append([]model.CustomRouteRule{}, nc.CustomRouteRules...)
 	blockRules, err := blocklist.LoadRules(context.Background(), kcfg.BlockList)
 	if err != nil {
-		nlog.Core().Error("failed to load blocklist routes", "error", err)
-	} else {
-		customRouteRules = append(customRouteRules, blockRules...)
+		nlog.Core().Warn("blocklist source unavailable", "error", err)
 	}
+	customRouteRules = append(customRouteRules, blockRules...)
 
 	// Merge panel routes, node-side blocklist, and static config routes.
 	cfg["routing"] = buildRouting(nc.Routes, customRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))

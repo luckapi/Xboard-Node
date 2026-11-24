@@ -26,8 +26,9 @@ func (s *StringOrArray) UnmarshalJSON(data []byte) error {
 
 // HandshakeResponse is the response from POST /api/v2/server/handshake
 type HandshakeResponse struct {
-	WebSocket WSConfig `json:"websocket"`
-	Settings  Settings `json:"settings"`
+	WebSocket         WSConfig `json:"websocket"`
+	Settings          Settings `json:"settings"`
+	TrafficBatchDedup bool     `json:"traffic_batch_dedup"`
 }
 
 func (h *HandshakeResponse) UnmarshalJSON(data []byte) error {

@@ -126,11 +126,15 @@ func (p *MachinePanelControlPlane) Discover(
 }
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
-	return p.client.Report(
+	return p.client.ReportBatch(payload.TrafficBatchID,
 		payload.Traffic, payload.Alive, payload.Online,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,
 	)
+}
+
+func (p *MachinePanelControlPlane) SupportsTrafficBatchDedup() bool {
+	return p.client.SupportsTrafficBatchDedup()
 }
 
 func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {

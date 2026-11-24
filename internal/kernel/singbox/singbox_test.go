@@ -9,10 +9,31 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/sagernet/sing-box/adapter"
 	singM "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/time/rate"
 )
+
+func TestTrackerUserMapIsStagedBeforeAuthenticationUpdate(t *testing.T) {
+	s := New(config.KernelConfig{})
+	s.users = []model.UserSpec{{ID: 1, UUID: "old"}}
+	s.connTracker = NewConnTracker(0)
+	s.connTracker.SetUserMap(buildUserMap(s.users))
+	next := []model.UserSpec{{ID: 2, UUID: "new"}}
+	finish := s.stageTrackerUsers(next)
+	if s.connTracker.uuidMap["old"] != 1 || s.connTracker.uuidMap["new"] != 2 {
+		t.Fatal("staged identities lack counters")
+	}
+	finish(false)
+	if len(s.connTracker.uuidMap) != 1 || s.connTracker.uuidMap["old"] != 1 {
+		t.Fatal("failed update did not restore identity mapping")
+	}
+	s.stageTrackerUsers(next)(true)
+	if len(s.connTracker.uuidMap) != 1 || s.connTracker.uuidMap["new"] != 2 {
+		t.Fatal("successful update retained obsolete credentials")
+	}
+}
 
 func TestSingBoxCapabilities(t *testing.T) {
 	s := New(config.KernelConfig{Type: "sing-box"})
@@ -36,8 +57,6 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
-
-
 type testConn struct {
 	closed bool
 	reads  [][]byte
@@ -60,11 +79,11 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {

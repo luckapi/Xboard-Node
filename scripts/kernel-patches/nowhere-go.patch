@@ -1,0 +1,212 @@
+diff --git a/dgram/router.go b/dgram/router.go
+index a479bfa..64122d6 100644
+--- a/dgram/router.go
++++ b/dgram/router.go
+@@ -21,6 +21,8 @@ type Flow struct {
+ 	C      chan []byte
+ 	closed chan struct{}
+ 	once   sync.Once
++	mu     sync.Mutex
++	router *Router
+ }
+ 
+ // Close unblocks receivers.
+@@ -28,7 +30,26 @@ func (f *Flow) Close() {
+ 	if f == nil {
+ 		return
+ 	}
+-	f.once.Do(func() { close(f.closed) })
++	f.once.Do(func() {
++		f.mu.Lock()
++		defer f.mu.Unlock()
++		close(f.closed)
++		for {
++			select {
++			case packet := <-f.C:
++				f.ReleasePacket(packet)
++			default:
++				return
++			}
++		}
++	})
++}
++
++// ReleasePacket returns the queued-byte reservation after receiving from C.
++func (f *Flow) ReleasePacket(packet []byte) {
++	if f.router != nil {
++		f.router.queuedBytes.Add(-int64(max(1, len(packet))))
++	}
+ }
+ 
+ // Done returns a channel that is closed when the flow is closed.
+@@ -41,12 +62,14 @@ func (f *Flow) Done() <-chan struct{} {
+ 
+ // Router demultiplexes datagrams on one QUIC connection.
+ type Router struct {
+-	conn     qio.Conn
+-	overhead int
+-	mu       sync.Mutex
+-	tab      map[uint32]*Flow
+-	re       *wire.Reassembler
+-	pkt      atomic.Uint32
++	maxQueuedBytes int64
++	queuedBytes    atomic.Int64
++	conn           qio.Conn
++	overhead       int
++	mu             sync.Mutex
++	tab            map[uint32]*Flow
++	re             *wire.Reassembler
++	pkt            atomic.Uint32
+ }
+ 
+ // NewRouter returns a router whose reassembly reservation is maxBytes.
+@@ -56,9 +79,10 @@ func NewRouter(conn qio.Conn, maxBytes int) *Router {
+ 		maxBytes = 4 << 20
+ 	}
+ 	return &Router{
+-		conn: conn,
+-		tab:  map[uint32]*Flow{},
+-		re:   wire.NewReassembler(64, maxBytes, 0),
++		maxQueuedBytes: int64(maxBytes),
++		conn:           conn,
++		tab:            map[uint32]*Flow{},
++		re:             wire.NewReassembler(64, maxBytes, 0),
+ 	}
+ }
+ 
+@@ -76,7 +100,7 @@ func (r *Router) SetOverhead(n int) {
+ 
+ // Register installs a flow. The previous flow with the same id is closed.
+ func (r *Router) Register(id uint32) *Flow {
+-	f := &Flow{ID: id, C: make(chan []byte, queueLen), closed: make(chan struct{})}
++	f := &Flow{ID: id, C: make(chan []byte, queueLen), closed: make(chan struct{}), router: r}
+ 	r.mu.Lock()
+ 	if old := r.tab[id]; old != nil {
+ 		old.Close()
+@@ -184,10 +208,29 @@ func (r *Router) deliver(id uint32, payload []byte) {
+ 	if f == nil {
+ 		return
+ 	}
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	select {
++	case <-f.closed:
++		return
++	default:
++	}
++	size := int64(max(1, len(payload)))
++	for {
++		used := r.queuedBytes.Load()
++		if size > r.maxQueuedBytes-used {
++			return
++		}
++		if r.queuedBytes.CompareAndSwap(used, used+size) {
++			break
++		}
++	}
+ 	select {
+ 	case <-f.closed:
++		f.ReleasePacket(payload)
+ 	case f.C <- payload:
+ 	default:
++		f.ReleasePacket(payload)
+ 	}
+ }
+ 
+@@ -213,6 +256,7 @@ func (p *PacketConn) Read(b []byte) (int, error) {
+ 	case <-p.Flow.closed:
+ 		return 0, io.EOF
+ 	case pkt := <-p.Flow.C:
++		p.Flow.ReleasePacket(pkt)
+ 		n := copy(b, pkt)
+ 		return n, nil
+ 	}
+diff --git a/dgram/xboard_budget_test.go b/dgram/xboard_budget_test.go
+new file mode 100644
+index 0000000..63a110a
+--- /dev/null
++++ b/dgram/xboard_budget_test.go
+@@ -0,0 +1,38 @@
++package dgram
++
++import (
++	"sync"
++	"testing"
++)
++
++func TestXboardQueueByteBudgetAndClose(t *testing.T) {
++	router := NewRouter(nil, 8)
++	first, second := router.Register(1), router.Register(2)
++	router.deliver(1, make([]byte, 6))
++	router.deliver(2, make([]byte, 3))
++	if len(second.C) != 0 || router.queuedBytes.Load() != 6 {
++		t.Fatal("session queue budget exceeded")
++	}
++	first.ReleasePacket(<-first.C)
++	router.deliver(2, nil)
++	if router.queuedBytes.Load() != 1 {
++		t.Fatal("empty UDP packet must reserve one budget unit")
++	}
++	second.Close()
++	if router.queuedBytes.Load() != 0 {
++		t.Fatal("closing a flow leaked queue reservations")
++	}
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 100; i++ {
++			router.deliver(1, []byte{1})
++		}
++	}()
++	go func() { defer wg.Done(); first.Close() }()
++	wg.Wait()
++	if router.queuedBytes.Load() != 0 {
++		t.Fatal("concurrent delivery and close leaked reservations")
++	}
++}
+diff --git a/egress/client.go b/egress/client.go
+index 718f75e..6662669 100644
+--- a/egress/client.go
++++ b/egress/client.go
+@@ -515,6 +515,7 @@ func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up,
+ 			_ = client.CloseWrite()
+ 			return
+ 		case pkt, ok := <-flow.C:
++			flow.ReleasePacket(pkt)
+ 			if !ok {
+ 				_ = udp.Close()
+ 				wg.Wait()
+diff --git a/portal/server.go b/portal/server.go
+index 65dd363..0ce720b 100644
+--- a/portal/server.go
++++ b/portal/server.go
+@@ -685,6 +685,7 @@ func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, u
+ 			_ = client.CloseWrite()
+ 			return
+ 		case pkt, ok := <-flow.C:
++			flow.ReleasePacket(pkt)
+ 			if !ok {
+ 				_ = udp.Close()
+ 				wg.Wait()
+@@ -777,6 +778,7 @@ func bridgeUoT(tls *pipe, router *dgram.Router, id uint32, quic *pipe, up, down
+ 			_ = quic.CloseWrite()
+ 			return
+ 		case pkt, ok := <-flow.C:
++			flow.ReleasePacket(pkt)
+ 			if !ok {
+ 				_ = tls.Close()
+ 				wg.Wait()
+@@ -832,10 +834,12 @@ func bridgeUDP(from *dgram.Router, fromID uint32, fromCtl *pipe, to *dgram.Route
+ 			_ = toCtl.CloseWrite()
+ 			return
+ 		case pkt, ok := <-left.C:
++			left.ReleasePacket(pkt)
+ 			if !ok || to.Send(toID, pkt) != nil {
+ 				finish()
+ 			}
+ 		case pkt, ok := <-right.C:
++			right.ReleasePacket(pkt)
+ 			if !ok || from.Send(fromID, pkt) != nil {
+ 				finish()
+ 			}

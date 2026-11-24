@@ -1,0 +1,7 @@
+third_party/
+artifacts/
+/xboard-node
+/xboard-node-linux-*
+/xbctl
+/xbctl-linux-*
+config.yml

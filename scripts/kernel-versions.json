@@ -1,0 +1,26 @@
+[
+  {
+    "name": "sing-box",
+    "module": "github.com/sagernet/sing-box",
+    "version": "v1.14.4",
+    "sum": "h1:KV6J8v1zMUu7BZA93nD9HGMmQnNC46VTuYaKEHkP+gA="
+  },
+  {
+    "name": "xray-core",
+    "module": "github.com/xtls/xray-core",
+    "version": "v1.260327.1-0.20261109052709-676eaf66f8f0",
+    "sum": "h1:p2uoadP+ulClbJ9dn+QioF2SfBqRly6VoKJosHqwcRo="
+  },
+  {
+    "name": "sudoku",
+    "module": "github.com/SUDOKU-ASCII/sudoku",
+    "version": "v0.5.2-1",
+    "sum": "h1:9kZQCcx53vpuNVbyZCbY0tyUPWmJmwMFWE8QkKitBgI="
+  },
+  {
+    "name": "nowhere-go",
+    "module": "github.com/ohmycggk/nowhere-go",
+    "version": "v1.8.4-0.20261115050956-bd502ab91f3e",
+    "sum": "h1:iTlbVp/xBd/Ikk4oRXUxX4HEjmTFe8BDKQK6MLfizS8="
+  }
+]
