@@ -13,6 +13,7 @@ INSTALL_ROOT="/etc/xboard-node"
 BACKUP_DIR="${INSTALL_ROOT}/backups"
 INSTALL_META="${INSTALL_ROOT}/install-meta.json"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
+BLOCKLIST_FILE="${INSTALL_ROOT}/blockList"
 CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
 BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
@@ -30,6 +31,7 @@ DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
 DEFAULT_DOWNLOAD_BASE="https://github.com/luckapi/xboard-node/releases"
+DEFAULT_BLOCKLIST_DOWNLOAD="https://raw.githubusercontent.com/luckapi/Xboard-Node/refs/heads/dev/rules/blockList"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -44,6 +46,9 @@ HEALTH_PORT="${DEFAULT_HEALTH_PORT}"
 HEALTH_ENABLED=1
 RUNTIME_GOMEMLIMIT=""
 RUNTIME_GOGC=""
+BLOCKLIST_URL=""
+USE_MANAGED_BLOCKLIST=true
+BLOCKLIST_WRITTEN=0
 BINARY_SOURCE=""
 CLI_BINARY_SOURCE=""
 FORCE_RECONFIGURE=0
@@ -106,6 +111,13 @@ rollback_install() {
             install -m 600 "$BACKUP_PATH/config.yml" "$CONFIG_FILE"
         else
             rm -f "$CONFIG_FILE"
+        fi
+        if [ "$BLOCKLIST_WRITTEN" -eq 1 ]; then
+            if [ -f "$BACKUP_PATH/blockList" ]; then
+                install -m 644 "$BACKUP_PATH/blockList" "$BLOCKLIST_FILE"
+            else
+                rm -f "$BLOCKLIST_FILE"
+            fi
         fi
         if [ -f "$BACKUP_PATH/credentials.env" ]; then
             install -m 600 "$BACKUP_PATH/credentials.env" "$CREDENTIALS_FILE"
@@ -203,6 +215,7 @@ usage() {
     --health-port       Local health port (default: 65530, use 0 to disable)
     --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
     --gogc              Runtime GOGC value, e.g. 50
+    --blocklist-url URL Configure remote audit rules (install only; default downloads a local list)
     --force-reconfigure Overwrite an existing install even if mode/target changed
     --purge             With uninstall, delete /etc/xboard-node too
     --yes, -y           Non-interactive confirmation for destructive operations
@@ -276,6 +289,14 @@ parse_args() {
                 RUNTIME_GOGC="$2"
                 shift 2
                 ;;
+            --blocklist-url)
+                if [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+                    log_error "--blocklist-url requires a URL"
+                    exit 1
+                fi
+                BLOCKLIST_URL="$2"
+                shift 2
+                ;;
             --force-reconfigure)
                 FORCE_RECONFIGURE=1
                 shift
@@ -301,6 +322,10 @@ parse_args() {
 
     if [ ${#positional[@]} -gt 0 ] && [ "$ACTION" = "install" ]; then
         ACTION="${positional[0]}"
+    fi
+    if [ -n "$BLOCKLIST_URL" ] && [ "$ACTION" != "install" ]; then
+        log_error "--blocklist-url is only supported with install"
+        exit 1
     fi
 
     case "$KERNEL_TYPE" in
@@ -732,6 +757,9 @@ render_config() {
     if [ -n "$RUNTIME_GOGC" ] && [ "$RUNTIME_GOGC" -gt 0 ] 2>/dev/null; then
         init_args+=(--gogc "$RUNTIME_GOGC")
     fi
+    if [ -n "$BLOCKLIST_URL" ]; then
+        init_args+=(--blocklist-url "$BLOCKLIST_URL")
+    fi
 
     local output
     output=$("$TMP_DIR/xbctl" "${init_args[@]}") || {
@@ -740,7 +768,35 @@ render_config() {
     }
 
     INSTANCE_ID=$(echo "$output" | grep '^INSTANCE_ID=' | cut -d= -f2-)
+    if [ -n "$BLOCKLIST_URL" ] && ! grep -qx 'BLOCKLIST_REMOTE=true' <<<"$output"; then
+        log_error "This xbctl build does not support --blocklist-url"
+        return 1
+    fi
+    if grep -qx 'BLOCKLIST_LOCAL=false' <<<"$output"; then
+        USE_MANAGED_BLOCKLIST=false
+    fi
     chmod 600 "$TMP_DIR/credentials.env"
+}
+
+stage_blocklist() {
+    if [ "$USE_MANAGED_BLOCKLIST" != true ]; then
+        return 0
+    fi
+    if [ -f "$BLOCKLIST_FILE" ] && grep -Eq '^[[:space:]]*[^#[:space:]]' "$BLOCKLIST_FILE"; then
+        return 0
+    fi
+    log_step "Downloading default audit rules: $DEFAULT_BLOCKLIST_DOWNLOAD"
+    curl --proto '=https' -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+        "$DEFAULT_BLOCKLIST_DOWNLOAD" -o "$TMP_DIR/blockList"
+    if ! awk '
+        { sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); }
+        NF && $0 !~ /^[A-Za-z0-9_.:*\/-]+$/ { exit 1 }
+        NF { found = 1 }
+        END { if (!found) exit 1 }
+    ' "$TMP_DIR/blockList"; then
+        log_error "Downloaded audit rule file is empty or invalid"
+        return 1
+    fi
 }
 
 render_service() {
@@ -833,6 +889,9 @@ backup_existing_state() {
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
     fi
+    if [ -f "$TMP_DIR/blockList" ] && [ -f "$BLOCKLIST_FILE" ]; then
+        cp "$BLOCKLIST_FILE" "$BACKUP_PATH/blockList"
+    fi
     if [ -f "$CREDENTIALS_FILE" ]; then
         cp "$CREDENTIALS_FILE" "$BACKUP_PATH/credentials.env"
     fi
@@ -856,6 +915,10 @@ stop_existing_service() {
 install_staged_files() {
     stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
+    if [ -f "$TMP_DIR/blockList" ]; then
+        BLOCKLIST_WRITTEN=1
+        install -m 644 "$TMP_DIR/blockList" "$BLOCKLIST_FILE"
+    fi
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
@@ -930,6 +993,7 @@ perform_install() {
         render_openrc_wrapper
     fi
     render_config
+    stage_blocklist
     render_service
     backup_existing_state
     install_staged_files

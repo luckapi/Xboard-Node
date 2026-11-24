@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1324,10 +1325,14 @@ func runConfigInit(args []string) error {
 		installRoot    string
 		token          string
 		releaseVersion string
+		blockListURL   string
 	)
 
 	for i := 0; i < len(args); i++ {
 		if i+1 >= len(args) {
+			if args[i] == "--blocklist-url" {
+				return errors.New("--blocklist-url requires a URL")
+			}
 			break
 		}
 		switch args[i] {
@@ -1398,6 +1403,13 @@ func runConfigInit(args []string) error {
 		case "--version":
 			i++
 			releaseVersion = args[i]
+		case "--blocklist-url":
+			i++
+			u, err := url.Parse(strings.TrimSpace(args[i]))
+			if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") {
+				return errors.New("--blocklist-url requires an HTTP or HTTPS URL")
+			}
+			blockListURL = u.String()
 		}
 	}
 
@@ -1418,12 +1430,14 @@ func runConfigInit(args []string) error {
 	}
 
 	// Build the new instance.
+	defaultBlockListPath := filepath.Join(installRoot, "blockList")
+	auditEnabled := true
 	inst := config.Config{
 		Panel: config.PanelConfig{URL: panelURL},
 		Kernel: config.KernelConfig{
 			Type:      kernelType,
 			LogLevel:  "warn",
-			BlockList: config.BlockListConfig{Path: filepath.Join(installRoot, "blockList")},
+			BlockList: config.BlockListConfig{Enabled: &auditEnabled, Path: defaultBlockListPath},
 		},
 		Log:        config.LogConfig{Level: "info", Output: "stdout"},
 		HealthPort: healthPort,
@@ -1498,16 +1512,26 @@ func runConfigInit(args []string) error {
 	}
 
 	// Merge: replace if same ID exists, otherwise append.
-	replaced := false
+	if !root.Kernel.BlockList.IsZero() {
+		inst.Kernel.BlockList = config.BlockListConfig{}
+	}
+	replaceIndex := -1
 	for i, existing := range instances {
 		if existing.InstanceID == instanceID {
-			instances[i] = inst
-			replaced = true
+			if !existing.Kernel.BlockList.IsZero() {
+				inst.Kernel.BlockList = existing.Kernel.BlockList
+			}
+			replaceIndex = i
 			break
 		}
 	}
-	if !replaced {
+	if blockListURL != "" {
+		inst.Kernel.BlockList = config.BlockListConfig{Enabled: &auditEnabled, URL: blockListURL}
+	}
+	if replaceIndex < 0 {
 		instances = append(instances, inst)
+	} else {
+		instances[replaceIndex] = inst
 	}
 	root.Instances = instances
 
@@ -1521,10 +1545,6 @@ func runConfigInit(args []string) error {
 	if err := writeRootConfig(configOut, root); err != nil {
 		return err
 	}
-	if err := ensureBlockListSeed(inst.Kernel.BlockList.Path); err != nil {
-		return err
-	}
-
 	// Write credentials.
 	if token != "" && credentialsOut != "" {
 		if err := mergeCredentials(credentialsIn, credentialsOut, envKey, token); err != nil {
@@ -1542,6 +1562,15 @@ func runConfigInit(args []string) error {
 	// Output for bash capture.
 	fmt.Printf("INSTANCE_ID=%s\n", instanceID)
 	fmt.Printf("ENV_KEY=%s\n", envKey)
+	effectiveBlockList := inst.Kernel.BlockList
+	if effectiveBlockList.IsZero() {
+		effectiveBlockList = root.Kernel.BlockList
+	}
+	managedBlockList := effectiveBlockList.EffectiveEnabled() && filepath.Clean(effectiveBlockList.Path) == defaultBlockListPath
+	fmt.Printf("BLOCKLIST_LOCAL=%t\n", managedBlockList)
+	if blockListURL != "" {
+		fmt.Println("BLOCKLIST_REMOTE=true")
+	}
 	return nil
 }
 
@@ -1654,33 +1683,6 @@ func runConfigHealthPort(args []string) error {
 	}
 	if root.Config.HealthPort > 0 {
 		fmt.Println(root.Config.HealthPort)
-	}
-	return nil
-}
-
-func ensureBlockListSeed(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create blocklist dir: %w", err)
-	}
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat blocklist file: %w", err)
-	}
-	const sample = `# Node-side audit/blocklist
-# One domain suffix, keyword, or CIDR per line.
-# Examples:
-# bbc.com
-# bbci.co.uk
-# github.com
-# falundafa
-`
-	if err := os.WriteFile(path, []byte(sample), 0o644); err != nil {
-		return fmt.Errorf("write blocklist seed: %w", err)
 	}
 	return nil
 }

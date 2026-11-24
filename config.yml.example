@@ -10,8 +10,11 @@
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
+#   # The installer downloads the rules to this path and configures it by default.
 #   blocklist:
-#     url: "https://raw.githubusercontent.com/Rakau/blockList/main/blockList"
+#     enabled: true
+#     path: "/etc/xboard-node/blockList"
+#     # url: "https://sh.lefly.co/xiaoji/xbnode/kaifa/blockList"  # Opt in to fetching remote rules.
 # log:
 #   level: "info"
 # instances:
